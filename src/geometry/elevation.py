@@ -8,7 +8,9 @@ import numpy as np
 import requests
 from typing import Optional
 
-OPENTOPODATA_URL = "https://api.opentopodata.org/v1/copernicus30"
+# eudem25m = EU-DEM 25m (best for Europe); srtm30m = global fallback
+OPENTOPODATA_DATASETS = ["eudem25m", "srtm30m", "aster30m"]
+OPENTOPODATA_BASE = "https://api.opentopodata.org/v1/{dataset}"
 BATCH_SIZE = 100  # API limit per request
 REQUEST_TIMEOUT = 30
 
@@ -22,25 +24,35 @@ def sample_elevations(
 ) -> list[Optional[float]]:
     """
     Query OpenTopoData for elevations at each (lat, lon).
+    Tries EU-DEM first, falls back to SRTM30m and ASTER30m.
     Returns a list of elevations (m) in the same order; None where unavailable.
     """
     elevations = []
     for batch_start in range(0, len(coords_latlon), BATCH_SIZE):
         batch = coords_latlon[batch_start:batch_start + BATCH_SIZE]
         locations = "|".join(f"{lat},{lon}" for lat, lon in batch)
-        try:
-            resp = requests.get(
-                OPENTOPODATA_URL,
-                params={"locations": locations},
-                timeout=REQUEST_TIMEOUT,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            for result in data.get("results", []):
-                elevations.append(result.get("elevation"))
-        except Exception:
-            elevations.extend([None] * len(batch))
+        batch_elevs = _query_batch(locations, len(batch))
+        elevations.extend(batch_elevs)
     return elevations
+
+
+def _query_batch(locations: str, n: int) -> list[Optional[float]]:
+    """Try each dataset in order; return first successful non-null result set."""
+    for dataset in OPENTOPODATA_DATASETS:
+        url = OPENTOPODATA_BASE.format(dataset=dataset)
+        try:
+            resp = requests.get(url, params={"locations": locations}, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 429:
+                import time; time.sleep(2)
+                resp = requests.get(url, params={"locations": locations}, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            results = resp.json().get("results", [])
+            elevs = [r.get("elevation") for r in results]
+            if any(e is not None for e in elevs):
+                return elevs
+        except Exception:
+            continue
+    return [None] * n
 
 
 def interpolate_along_alignment(

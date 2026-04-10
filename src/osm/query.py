@@ -3,18 +3,38 @@ Overpass API queries for railway data.
 Supports search by name, relation ID, and bounding box.
 """
 
+import time
 import requests
-import json
 from typing import Optional
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+]
 TIMEOUT = 60
 
 
 def _run_query(query: str) -> dict:
-    response = requests.post(OVERPASS_URL, data={"data": query}, timeout=TIMEOUT)
-    response.raise_for_status()
-    return response.json()
+    last_exc = None
+    for url in OVERPASS_ENDPOINTS:
+        try:
+            response = requests.post(url, data={"data": query}, timeout=TIMEOUT)
+            if response.status_code == 429:
+                time.sleep(5)
+                response = requests.post(url, data={"data": query}, timeout=TIMEOUT)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as exc:
+            last_exc = exc
+            if exc.response is not None and exc.response.status_code in (429, 504):
+                time.sleep(3)
+                continue
+            raise
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            continue
+    raise last_exc
 
 
 def search_railways_by_name(name: str) -> list[dict]:

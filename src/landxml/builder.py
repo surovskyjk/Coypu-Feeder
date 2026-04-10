@@ -33,11 +33,11 @@ def build_landxml(
         "sta_start": float,
       }
     """
-    nsmap = {None: LANDXML_NS}
+    XSI_NS = "http://www.w3.org/2001/XMLSchema-instance"
+    nsmap = {None: LANDXML_NS, "xsi": XSI_NS}
     root = etree.Element("LandXML", nsmap=nsmap)
     root.set("version", "1.2")
-    root.set("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance")
-    root.set("xsi:schemaLocation", XSD_LOC)
+    root.set(f"{{{XSI_NS}}}schemaLocation", XSD_LOC)
     root.set("date", datetime.utcnow().strftime("%Y-%m-%d"))
     root.set("time", datetime.utcnow().strftime("%H:%M:%S"))
     root.set("readOnly", "false")
