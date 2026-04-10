@@ -177,22 +177,13 @@ class App(ctk.CTk):
         if epsg == -1:
             work_epsg = auto_utm_epsg(selected_tracks[0].nodes)
 
-        # ── First pass: project all tracks, collect all XY for offset calc ──
+        # ── Project all tracks ──
         all_projected: list[np.ndarray] = []
         for track in selected_tracks:
             xy = np.array(wgs84_to_projected(track.nodes, work_epsg))
+            if force_positive:
+                xy = np.abs(xy)   # strip minus sign, keep the number (e.g. S-JTSK)
             all_projected.append(xy)
-
-        # Compute offset to force positive coordinates if requested
-        coord_offset = (0.0, 0.0)
-        if force_positive:
-            all_x = np.concatenate([xy[:, 0] for xy in all_projected])
-            all_y = np.concatenate([xy[:, 1] for xy in all_projected])
-            dx = max(0.0, -float(all_x.min())) + 100.0 if all_x.min() < 0 else 0.0
-            dy = max(0.0, -float(all_y.min())) + 100.0 if all_y.min() < 0 else 0.0
-            coord_offset = (dx, dy)
-            if dx > 0 or dy > 0:
-                all_projected = [xy + np.array([dx, dy]) for xy in all_projected]
 
         # ── Second pass: fit geometry and build alignments ──
         alignments = []
@@ -225,7 +216,7 @@ class App(ctk.CTk):
             alignments,
             output_epsg=work_epsg,
             project_name=project_name,
-            coord_offset=coord_offset,
+            force_positive=force_positive,
         )
         write_landxml(root, filepath)
 

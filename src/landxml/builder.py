@@ -23,13 +23,13 @@ def build_landxml(
     alignments: list[dict],
     output_epsg: int,
     project_name: str = "Railway Alignment",
-    coord_offset: tuple[float, float] = (0.0, 0.0),
+    force_positive: bool = False,
 ) -> etree._Element:
     """
     Build a LandXML 1.2 root element.
 
-    coord_offset: (dx, dy) added to every projected coordinate to enforce
-                  positive values. Noted in the Project description.
+    force_positive: if True, coordinate signs were stripped (abs applied)
+                    before reaching this function — noted in Project desc.
     """
     XSI_NS = "http://www.w3.org/2001/XMLSchema-instance"
     nsmap = {None: LANDXML_NS, "xsi": XSI_NS}
@@ -43,11 +43,10 @@ def build_landxml(
 
     proj_el = etree.SubElement(root, "Project")
     proj_el.set("name", project_name)
-    dx, dy = coord_offset
-    if dx != 0.0 or dy != 0.0:
+    if force_positive:
         proj_el.set("desc",
-                    f"Coordinate offset applied to ensure positive values: "
-                    f"dX={dx:.3f} m  dY={dy:.3f} m  (EPSG:{output_epsg})")
+                    f"Coordinates exported as absolute values (signs stripped) "
+                    f"for EPSG:{output_epsg} — numeric values are unchanged.")
 
     units_el = etree.SubElement(root, "Units")
     metric_el = etree.SubElement(units_el, "Metric")

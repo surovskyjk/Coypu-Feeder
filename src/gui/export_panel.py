@@ -126,7 +126,7 @@ class ExportPanel(ctk.CTkFrame):
         row += 1
         ctk.CTkLabel(
             self,
-            text="Adds a translation offset so no X or Y value\nis negative. Offset is noted in the file.",
+            text="Strips the minus sign — numeric values are\nunchanged (e.g. S-JTSK positive convention).",
             text_color="gray", font=("Helvetica", 9),
             justify="left", anchor="w",
         ).grid(row=row, column=0, sticky="w", padx=18, pady=(0, 8))
