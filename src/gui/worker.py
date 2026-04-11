@@ -167,6 +167,8 @@ class ExportWorker(QThread):
                 min_line_length=min_line,
                 min_arc_length=min_arc,
                 min_spiral_length=min_spiral,
+                max_deviation=s.get("max_deviation",  0.50),
+                check_interval=s.get("check_interval", 5.0),
             )
 
             self.stage_changed.emit(

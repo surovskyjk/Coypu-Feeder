@@ -120,6 +120,43 @@ class Step3Configure(QWidget):
         gf.addWidget(min_group)
         v.addWidget(geo_group)
 
+        # ── Alignment accuracy ────────────────────────────────────────
+        acc_group = QGroupBox("Alignment Accuracy")
+        acc_group.setToolTip(
+            "Controls how closely the fitted geometric elements must follow\n"
+            "the original OSM polyline. After the initial curvature-based fit,\n"
+            "any element whose maximum deviation exceeds the threshold is\n"
+            "recursively split and re-fitted."
+        )
+        af = QFormLayout(acc_group)
+
+        self._max_dev_spin = QDoubleSpinBox()
+        self._max_dev_spin.setRange(0.01, 5.0)
+        self._max_dev_spin.setSingleStep(0.05)
+        self._max_dev_spin.setValue(0.50)
+        self._max_dev_spin.setSuffix(" m")
+        self._max_dev_spin.setToolTip(
+            "Maximum allowed deviation between the fitted alignment element\n"
+            "and the original OSM polyline.\n"
+            "Smaller values → more elements, higher accuracy.\n"
+            "Typical range: 0.05 m (cm accuracy) to 2.0 m (rough fit)."
+        )
+        af.addRow("Max deviation from OSM line:", self._max_dev_spin)
+
+        self._check_interval_spin = QDoubleSpinBox()
+        self._check_interval_spin.setRange(1.0, 50.0)
+        self._check_interval_spin.setSingleStep(1.0)
+        self._check_interval_spin.setValue(5.0)
+        self._check_interval_spin.setSuffix(" m")
+        self._check_interval_spin.setToolTip(
+            "Sampling interval along each fitted element for deviation checking.\n"
+            "Smaller values catch localised deviations more precisely but are\n"
+            "slower. 5 m is a good default for typical railway OSM data."
+        )
+        af.addRow("Deviation check interval:", self._check_interval_spin)
+
+        v.addWidget(acc_group)
+
         # ── Options ──────────────────────────────────────────────────
         opt_group = QGroupBox("Options")
         of = QVBoxLayout(opt_group)
@@ -174,13 +211,15 @@ class Step3Configure(QWidget):
             epsg = CRS_PRESETS[idx][1]
 
         self.config_confirmed.emit({
-            "epsg": epsg,
-            "project_name": self._project_edit.text().strip() or "Railway Alignment",
-            "smooth_window": self._smooth_slider.value(),
-            "sample_interval": self._sample_spin.value(),
-            "vc_length": self._vc_spin.value(),
-            "min_line_length": self._min_line_spin.value(),
-            "min_arc_length": self._min_arc_spin.value(),
+            "epsg":             epsg,
+            "project_name":     self._project_edit.text().strip() or "Railway Alignment",
+            "smooth_window":    self._smooth_slider.value(),
+            "sample_interval":  self._sample_spin.value(),
+            "vc_length":        self._vc_spin.value(),
+            "min_line_length":  self._min_line_spin.value(),
+            "min_arc_length":   self._min_arc_spin.value(),
             "min_spiral_length": self._min_spiral_spin.value(),
-            "force_positive": self._force_pos_chk.isChecked(),
+            "force_positive":   self._force_pos_chk.isChecked(),
+            "max_deviation":    self._max_dev_spin.value(),
+            "check_interval":   self._check_interval_spin.value(),
         })
