@@ -1,6 +1,6 @@
 """
 Step 4 — Export.
-File chooser, progress bar with stage labels, start button.
+File chooser, progress bar with named stages, start button.
 After success: shows alignment on map and offers 'Export Another Railway'.
 """
 
@@ -15,31 +15,25 @@ from PySide6.QtGui import QFont
 
 from gui.worker import ExportWorker
 
-STAGES = [
-    "Projecting coordinates…",
-    "Fitting geometry…",
-    "Querying DEM elevation…",
-    "Building LandXML…",
-    "Writing file…",
-]
-# Map stage label prefix → approximate progress %
 STAGE_PCT = {
     "Projecting":  10,
     "Fitting":     30,
-    "Querying":    50,
-    "Building":    80,
-    "Writing":     90,
+    "Querying":    55,
+    "Building":    82,
+    "Writing":     92,
 }
 
 
 class Step4Export(QWidget):
-    # filepath + resolved work_epsg emitted on success
-    export_finished     = Signal(str, int)
-    start_over_requested = Signal()
+    # Emitted after successful export
+    export_finished          = Signal(str, int)   # filepath, work_epsg
+    alignment_ready          = Signal(list)        # [[lat,lon],...] per track
+    fit_to_alignment_requested = Signal()
+    start_over_requested     = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._tracks = []
+        self._tracks  = []
         self._settings: dict = {}
         self._worker: ExportWorker | None = None
         self._build()
@@ -53,7 +47,7 @@ class Step4Export(QWidget):
         lbl.setFont(QFont("Helvetica", 13, QFont.Weight.Bold))
         layout.addWidget(lbl)
 
-        # File path row
+        # ── File path ──────────────────────────────────────────────────
         file_row = QHBoxLayout()
         self._path_edit = QLineEdit()
         self._path_edit.setPlaceholderText("Choose output file…")
@@ -64,26 +58,23 @@ class Step4Export(QWidget):
         file_row.addWidget(browse_btn)
         layout.addLayout(file_row)
 
-        # Progress bar
+        # ── Progress ────────────────────────────────────────────────────
         self._progress = QProgressBar()
         self._progress.setRange(0, 100)
         self._progress.setValue(0)
-        self._progress.setTextVisible(True)
         layout.addWidget(self._progress)
 
-        # Stage label
         self._stage_lbl = QLabel("Ready.")
         self._stage_lbl.setStyleSheet("color:#aaa; font-size:11px;")
         layout.addWidget(self._stage_lbl)
 
-        # Chainage progress
         self._station_lbl = QLabel("")
         self._station_lbl.setStyleSheet("color:#888; font-size:10px;")
         layout.addWidget(self._station_lbl)
 
         layout.addStretch()
 
-        # ── Post-export actions (hidden until export done) ────────────
+        # ── Post-export actions (hidden until done) ────────────────────
         self._post_frame = QFrame()
         self._post_frame.setVisible(False)
         pv = QVBoxLayout(self._post_frame)
@@ -95,20 +86,26 @@ class Step4Export(QWidget):
         sep.setStyleSheet("color:#555;")
         pv.addWidget(sep)
 
-        self._show_map_lbl = QLabel("✅  Alignment drawn on map (dashed pink).")
-        self._show_map_lbl.setStyleSheet("color:#8bc34a; font-size:10px;")
-        self._show_map_lbl.setWordWrap(True)
-        pv.addWidget(self._show_map_lbl)
+        ok_lbl = QLabel("✅  Exported alignment drawn on map (bright red).")
+        ok_lbl.setStyleSheet("color:#8bc34a; font-size:10px;")
+        ok_lbl.setWordWrap(True)
+        pv.addWidget(ok_lbl)
+
+        post_btn_row = QHBoxLayout()
+        self._fit_aln_btn = QPushButton("📍  Zoom to exported line")
+        self._fit_aln_btn.clicked.connect(self.fit_to_alignment_requested.emit)
 
         self._restart_btn = QPushButton("🔄  Export Another Railway")
-        self._restart_btn.setMinimumHeight(36)
         self._restart_btn.setFont(QFont("Helvetica", 11, QFont.Weight.Bold))
         self._restart_btn.setStyleSheet(
             "QPushButton { background:#2a82da; color:#fff; border-radius:5px; }"
             "QPushButton:hover { background:#3a92ea; }"
         )
         self._restart_btn.clicked.connect(self.start_over_requested.emit)
-        pv.addWidget(self._restart_btn)
+
+        post_btn_row.addWidget(self._fit_aln_btn)
+        post_btn_row.addWidget(self._restart_btn)
+        pv.addLayout(post_btn_row)
 
         layout.addWidget(self._post_frame)
 
@@ -129,7 +126,7 @@ class Step4Export(QWidget):
     # ------------------------------------------------------------------
 
     def prepare(self, tracks, settings: dict):
-        self._tracks = tracks
+        self._tracks   = tracks
         self._settings = settings
         self._progress.setValue(0)
         self._stage_lbl.setText("Ready.")
@@ -144,7 +141,7 @@ class Step4Export(QWidget):
     def _browse(self):
         path, _ = QFileDialog.getSaveFileName(
             self, "Save LandXML file", "",
-            "LandXML files (*.xml);;All files (*.*)"
+            "LandXML files (*.xml);;All files (*.*)",
         )
         if path:
             self._path_edit.setText(path)
@@ -152,7 +149,8 @@ class Step4Export(QWidget):
     def _start_export(self):
         filepath = self._path_edit.text().strip()
         if not filepath:
-            QMessageBox.warning(self, "No file", "Please choose an output file first.")
+            QMessageBox.warning(self, "No file",
+                                "Please choose an output file first.")
             return
         if not self._tracks:
             QMessageBox.warning(self, "No data", "No tracks to export.")
@@ -167,13 +165,13 @@ class Step4Export(QWidget):
         self._worker = ExportWorker(self._tracks, self._settings, filepath, self)
         self._worker.stage_changed.connect(self._on_stage)
         self._worker.station_progress.connect(self._on_station_progress)
+        self._worker.alignment_ready.connect(self.alignment_ready.emit)  # forward
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
         self._worker.start()
 
     def _on_stage(self, stage: str):
         self._stage_lbl.setText(stage)
-        # Advance progress bar based on stage keyword
         pct = self._progress.value()
         for key, val in STAGE_PCT.items():
             if stage.startswith(key):
@@ -183,7 +181,9 @@ class Step4Export(QWidget):
 
     def _on_station_progress(self, current: float, total: float):
         if total > 0:
-            self._station_lbl.setText(f"Chainage: {current:.0f} / {total:.0f} m")
+            self._station_lbl.setText(
+                f"Chainage: {current:.0f} / {total:.0f} m"
+            )
 
     def _on_finished(self, filepath: str, work_epsg: int):
         self._progress.setValue(100)

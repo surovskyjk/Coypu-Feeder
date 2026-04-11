@@ -17,16 +17,15 @@ from PySide6.QtCore import QThread, Signal
 
 class SearchWorker(QThread):
     """
-    mode: "ref" | "name" | "number_in_name" | "bbox" | "relation_id"
-    query: str (relation_id uses int cast internally)
-           for bbox: (south, west, north, east) tuple
+    mode: "ref" | "name" | "number_in_name" | "bbox"
+    query: str for text modes; (south, west, north, east) tuple for bbox
     """
     results_ready = Signal(list)
-    failed = Signal(str)
+    failed        = Signal(str)
 
     def __init__(self, mode: str, query, parent=None):
         super().__init__(parent)
-        self._mode = mode
+        self._mode  = mode
         self._query = query
 
     def run(self):
@@ -37,15 +36,14 @@ class SearchWorker(QThread):
                 search_by_number_in_name,
                 search_relations_in_bbox,
             )
-            mode = self._mode
             q = self._query
-            if mode == "ref":
+            if self._mode == "ref":
                 results = search_by_ref(q)
-            elif mode == "name":
+            elif self._mode == "name":
                 results = search_railways_by_name(q)
-            elif mode == "number_in_name":
+            elif self._mode == "number_in_name":
                 results = search_by_number_in_name(q)
-            elif mode == "bbox":
+            elif self._mode == "bbox":
                 s, w, n, e = q
                 results = search_relations_in_bbox(s, w, n, e)
             else:
@@ -61,8 +59,8 @@ class SearchWorker(QThread):
 
 class FetchWorker(QThread):
     """Fetches full way/node data + metadata for a single OSM relation."""
-    data_ready = Signal(object, dict)  # (overpass_data, relation_info)
-    failed = Signal(str)
+    data_ready = Signal(object, dict)   # (overpass_data, relation_info)
+    failed     = Signal(str)
 
     def __init__(self, relation_id: int, parent=None):
         super().__init__(parent)
@@ -86,19 +84,25 @@ class FetchWorker(QThread):
 
 class ExportWorker(QThread):
     """
-    Runs the full projection → geometry → elevation → LandXML pipeline.
-    Emits stage_changed(str) at named checkpoints.
-    Emits station_progress(current_m, total_m) for elevation sampling.
-    Emits finished(filepath) on success, failed(str) on error.
+    Runs: projection → geometry fit → elevation → LandXML.
+
+    Signals
+    -------
+    stage_changed(str)          named stage banner
+    station_progress(float,float)  current / total chainage (m)
+    alignment_ready(list)       [[lat,lon],...] per track — for map display
+    finished(str, int)          filepath, work_epsg
+    failed(str)                 error message
     """
     stage_changed    = Signal(str)
     station_progress = Signal(float, float)
-    finished         = Signal(str, int)   # filepath, work_epsg
+    alignment_ready  = Signal(list)   # list of [[lat,lon],...] per track
+    finished         = Signal(str, int)
     failed           = Signal(str)
 
     def __init__(self, tracks, settings: dict, filepath: str, parent=None):
         super().__init__(parent)
-        self._tracks = tracks
+        self._tracks   = tracks
         self._settings = settings
         self._filepath = filepath
 
@@ -109,7 +113,7 @@ class ExportWorker(QThread):
         except Exception as exc:
             self.failed.emit(str(exc))
 
-    def _export(self):
+    def _export(self) -> int:
         from geometry.projection import wgs84_to_projected, auto_utm_epsg
         from geometry.alignment import fit_alignment
         from geometry.elevation import (
@@ -126,13 +130,17 @@ class ExportWorker(QThread):
         vc_length       = s["vc_length"]
         project_name    = s.get("project_name", "Railway Alignment")
         min_line        = s.get("min_line_length", 10.0)
-        min_arc         = s.get("min_arc_length", 10.0)
+        min_arc         = s.get("min_arc_length",  10.0)
         min_spiral      = s.get("min_spiral_length", 10.0)
 
-        # Determine working EPSG
-        work_epsg = epsg
-        if epsg == -1:
-            work_epsg = auto_utm_epsg(self._tracks[0].nodes)
+        # Resolve working EPSG
+        work_epsg = epsg if epsg != -1 else auto_utm_epsg(self._tracks[0].nodes)
+
+        # ── Emit WGS84 track paths for map display (before any projection/abs) ──
+        # Use original OSM nodes — always correct, independent of CRS/force_positive
+        self.alignment_ready.emit(
+            [[[lat, lon] for lat, lon in t.nodes] for t in self._tracks]
+        )
 
         self.stage_changed.emit("Projecting coordinates…")
         all_projected: list[np.ndarray] = []
@@ -143,12 +151,13 @@ class ExportWorker(QThread):
             all_projected.append(xy)
 
         alignments = []
-        n_tracks = len(self._tracks)
+        n_tracks   = len(self._tracks)
+
         for idx, (track, xy) in enumerate(zip(self._tracks, all_projected)):
             self.stage_changed.emit(
                 f"Fitting geometry ({idx + 1}/{n_tracks}): {track.name}…"
             )
-            chainages = compute_chainages(xy)
+            chainages  = compute_chainages(xy)
             h_elements = fit_alignment(
                 xy,
                 smooth_window=smooth_window,
@@ -165,13 +174,12 @@ class ExportWorker(QThread):
                 track.nodes, chainages, sample_interval=sample_interval
             )
             self.station_progress.emit(0.0, total_len)
-            elevs = sample_elevations(sample_latlon)
+            elevs      = sample_elevations(sample_latlon)
             self.station_progress.emit(total_len, total_len)
-
             v_elements = fit_vertical_geometry(sample_ch, elevs, vc_length=vc_length)
 
             alignments.append({
-                "name": track.name,
+                "name":     track.name,
                 "elements": h_elements,
                 "vertical": v_elements,
                 "sta_start": 0.0,

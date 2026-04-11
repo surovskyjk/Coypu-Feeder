@@ -5,10 +5,14 @@ Main application window — PySide6.
 
 from __future__ import annotations
 
-from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QHBoxLayout, QStackedWidget, QSizePolicy, QMessageBox,
-)
+import math
+
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QHBoxLayout, QStackedWidget,
+    QSizePolicy, QMessageBox, QApplication,
+)
 
 from .map_widget import MapWidget
 from .step_sidebar import StepSidebar
@@ -16,6 +20,9 @@ from .steps.step1_find import Step1Find
 from .steps.step2_section import Step2Section
 from .steps.step3_configure import Step3Configure
 from .steps.step4_export import Step4Export
+
+# Maximum map-view span (km) allowed for "search in view"
+_MAX_VIEW_KM = 20.0
 
 
 class App(QMainWindow):
@@ -25,13 +32,14 @@ class App(QMainWindow):
         self.resize(1340, 820)
         self.setMinimumSize(1050, 680)
 
-        self._tracks = []
-        self._selected_tracks = []
-        self._settings: dict = {}
-        self._bbox_workers: list = []
+        self._tracks: list          = []
+        self._selected_tracks: list = []
+        self._settings: dict        = {}
+        self._bbox_workers: list    = []
 
         self._build_layout()
         self._wire_signals()
+        self._connect_scheme_changes()
 
     # ------------------------------------------------------------------
     # Layout
@@ -44,17 +52,16 @@ class App(QMainWindow):
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(0)
 
-        # --- Left sidebar (200 px) ---
         self.sidebar = StepSidebar()
         self.sidebar.setFixedWidth(200)
         h.addWidget(self.sidebar)
 
-        # --- Map (flex) ---
         self.map_widget = MapWidget()
-        self.map_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.map_widget.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         h.addWidget(self.map_widget, stretch=1)
 
-        # --- Right step stack (340 px) ---
         self.stack = QStackedWidget()
         self.stack.setFixedWidth(340)
 
@@ -63,14 +70,15 @@ class App(QMainWindow):
         self.step3 = Step3Configure()
         self.step4 = Step4Export()
 
-        self.stack.addWidget(self.step1)   # index 0
-        self.stack.addWidget(self.step2)   # index 1
-        self.stack.addWidget(self.step3)   # index 2
-        self.stack.addWidget(self.step4)   # index 3
+        self.stack.addWidget(self.step1)   # 0
+        self.stack.addWidget(self.step2)   # 1
+        self.stack.addWidget(self.step3)   # 2
+        self.stack.addWidget(self.step4)   # 3
 
         h.addWidget(self.stack)
-
-        self.statusBar().showMessage("Ready. Draw a bbox on the map or search in the panel.")
+        self.statusBar().showMessage(
+            "Ready. Search for a railway or use 'Lines in View' after zooming in."
+        )
 
     # ------------------------------------------------------------------
     # Signal wiring
@@ -80,26 +88,44 @@ class App(QMainWindow):
         # Sidebar back-navigation
         self.sidebar.step_clicked.connect(self._goto_step)
 
-        # Bbox drawn on map → update Step 1 AND switch to it so user sees the search button
-        self.map_widget.bbox_drawn.connect(self.step1.set_bbox)
-        self.map_widget.bbox_drawn.connect(self._on_bbox_drawn)
+        # Map bounds → "Lines in View" search
+        self.step1.search_in_view_requested.connect(self._on_search_in_view)
+        self.map_widget.bounds_ready.connect(self._on_map_bounds_ready)
 
-        # "Search Railways in Bbox" button on map toolbar → direct search
-        self.map_widget.bbox_search_requested.connect(self._on_bbox_search_from_map)
-
-        # Step 1 → load railway
+        # Step 1 → fetch railway
         self.step1.railway_fetched.connect(self._on_railway_fetched)
 
-        # Step 2 → confirm section + map highlight
-        self.step2.section_confirmed.connect(self._on_section_confirmed)
+        # Step 2 → highlight / fit / confirm
         self.step2.highlight_changed.connect(self.map_widget.highlight_track)
+        self.step2.fit_to_tracks_requested.connect(self.map_widget.fly_to_tracks)
+        self.step2.section_confirmed.connect(self._on_section_confirmed)
 
-        # Step 3 → confirm config
+        # Step 3 → config confirmed
         self.step3.config_confirmed.connect(self._on_config_confirmed)
 
-        # Step 4 → export done / start over
+        # Step 4 → alignment display / fit / export / restart
+        self.step4.alignment_ready.connect(self.map_widget.show_alignment)
+        self.step4.fit_to_alignment_requested.connect(self.map_widget.fly_to_alignment)
         self.step4.export_finished.connect(self._on_export_finished)
         self.step4.start_over_requested.connect(self._start_over)
+
+    # ------------------------------------------------------------------
+    # System colour-scheme changes (dark ↔ light)
+    # ------------------------------------------------------------------
+
+    def _connect_scheme_changes(self):
+        try:
+            QGuiApplication.styleHints().colorSchemeChanged.connect(
+                self._on_color_scheme_changed
+            )
+        except Exception:
+            pass  # Qt < 6.5 — no signal, static theme is fine
+
+    def _on_color_scheme_changed(self, scheme):
+        from gui.theme import apply_theme
+        dark = (scheme == Qt.ColorScheme.Dark)
+        apply_theme(QApplication.instance(), dark)
+        self.map_widget.set_theme(dark)
 
     # ------------------------------------------------------------------
     # Step transitions
@@ -109,22 +135,44 @@ class App(QMainWindow):
         self.stack.setCurrentIndex(idx)
         self.sidebar.set_step(idx)
 
-    def _on_bbox_drawn(self, s: float, w: float, n: float, e: float):
-        """Switch to Step 1 after bbox drawn so user sees the enabled search button."""
-        self._goto_step(0)
+    # ------------------------------------------------------------------
+    # "Lines in View" search
+    # ------------------------------------------------------------------
+
+    def _on_search_in_view(self):
+        """Step 1 requested a search — ask the map for its current bounds."""
+        self.step1.set_view_search_busy(True)
+        self.map_widget.request_bounds()
+
+    def _on_map_bounds_ready(self, s: float, w: float, n: float, e: float):
+        """Map returned its bounds; validate area then run Overpass query."""
+        center_lat = (s + n) / 2.0
+        lat_km = (n - s) * 111.0
+        lon_km = (e - w) * 111.0 * math.cos(math.radians(center_lat))
+
+        if lat_km > _MAX_VIEW_KM or lon_km > _MAX_VIEW_KM:
+            self.step1.set_view_search_busy(False)
+            self.step1.show_view_results(
+                [],
+                status=(
+                    f"⚠ View too large ({lat_km:.0f} × {lon_km:.0f} km). "
+                    f"Zoom in to ≤ {_MAX_VIEW_KM:.0f} km and try again."
+                ),
+            )
+            self.statusBar().showMessage(
+                "View too large for 'Lines in View' search — zoom in more."
+            )
+            return
+
         self.statusBar().showMessage(
-            f"Bbox drawn ({s:.3f},{w:.3f} → {n:.3f},{e:.3f}). "
-            "Click '🔍 Search Railways in Bbox' on the map toolbar, or use the panel."
+            f"Searching railway lines in {lat_km:.1f} × {lon_km:.1f} km view…"
         )
 
-    def _on_bbox_search_from_map(self, s: float, w: float, n: float, e: float):
-        """Direct bbox search triggered from the map toolbar button."""
         from gui.worker import SearchWorker
-        self.statusBar().showMessage("Searching for railway lines in bbox…")
         worker = SearchWorker("bbox", (s, w, n, e), self)
-        worker.results_ready.connect(self._on_bbox_results_ready)
-        worker.failed.connect(lambda err: QMessageBox.critical(self, "Bbox search failed", err))
-        worker.failed.connect(lambda: self.statusBar().showMessage("Bbox search failed."))
+        worker.results_ready.connect(self._on_view_results_ready)
+        worker.failed.connect(self._on_view_search_failed)
+        worker.finished.connect(lambda: self.step1.set_view_search_busy(False))
         worker.finished.connect(
             lambda: self._bbox_workers.remove(worker)
             if worker in self._bbox_workers else None
@@ -132,14 +180,20 @@ class App(QMainWindow):
         self._bbox_workers.append(worker)
         worker.start()
 
-    def _on_bbox_results_ready(self, results: list):
-        self.step1.populate_results(results)
-        self._goto_step(0)
+    def _on_view_results_ready(self, results: list):
         n = len(results)
-        self.statusBar().showMessage(
-            f"Found {n} railway line{'s' if n != 1 else ''} in bbox. "
-            "Click a result to load it."
-        )
+        status = f"Found {n} railway line{'s' if n != 1 else ''} in current view."
+        self.step1.show_view_results(results, status)
+        self._goto_step(0)
+        self.statusBar().showMessage(status + " Click a result to load it.")
+
+    def _on_view_search_failed(self, error: str):
+        self.step1.show_view_results([], status=f"Search failed: {error}")
+        self.statusBar().showMessage(f"Lines-in-View search failed: {error}")
+
+    # ------------------------------------------------------------------
+    # Railway loaded
+    # ------------------------------------------------------------------
 
     def _on_railway_fetched(self, overpass_data, relation_info: dict):
         from osm.parser import parse_tracks
@@ -147,20 +201,27 @@ class App(QMainWindow):
         if not self._tracks:
             QMessageBox.warning(
                 self, "No tracks found",
-                "The relation was fetched but no track segments could be extracted.\n"
-                "The relation may contain no ways, or its ways are not connected."
+                "The relation was fetched but no continuous track could be "
+                "extracted.\nThe relation may have no ways, or its ways are "
+                "not connected."
             )
-            self.statusBar().showMessage("No tracks found in the fetched relation.")
+            self.statusBar().showMessage("No tracks found in relation.")
             return
+
         self.map_widget.clear_alignment()
         self.map_widget.show_tracks(self._tracks)
         self.step2.populate(self._tracks)
         n = len(self._tracks)
+        name = relation_info.get("name", "")
         self.statusBar().showMessage(
-            f"Loaded '{relation_info.get('name', '')}' — "
-            f"{n} track{'s' if n != 1 else ''}. Select tracks and click Next."
+            f"Loaded '{name}' — {n} track{'s' if n != 1 else ''}. "
+            "Select tracks and click Next."
         )
         self._goto_step(1)
+
+    # ------------------------------------------------------------------
+    # Section confirmed
+    # ------------------------------------------------------------------
 
     def _on_section_confirmed(self, selected_tracks: list):
         self._selected_tracks = selected_tracks
@@ -169,99 +230,39 @@ class App(QMainWindow):
         )
         self._goto_step(2)
 
+    # ------------------------------------------------------------------
+    # Config confirmed
+    # ------------------------------------------------------------------
+
     def _on_config_confirmed(self, settings: dict):
         self._settings = settings
         self.step4.prepare(self._selected_tracks, settings)
-        self.statusBar().showMessage("Settings confirmed. Choose a file and click 'Start Export'.")
+        self.statusBar().showMessage(
+            "Settings confirmed. Choose a file and click 'Start Export'."
+        )
         self._goto_step(3)
 
     # ------------------------------------------------------------------
-    # Export + alignment display
+    # Export finished
     # ------------------------------------------------------------------
 
     def _on_export_finished(self, filepath: str, work_epsg: int):
-        """Parse the exported LandXML and draw the alignment back on the map."""
-        self.statusBar().showMessage(f"Export complete: {filepath}")
-        try:
-            force_positive = self._settings.get("force_positive", False)
-            alignments = self._parse_alignment_for_map(filepath, work_epsg, force_positive)
-            if alignments:
-                self.map_widget.show_alignment(alignments)
-                self.statusBar().showMessage(
-                    f"Export complete — alignment drawn on map (dashed pink). {filepath}"
-                )
-        except Exception as exc:
-            # Don't let a display failure mask a successful export
-            self.statusBar().showMessage(
-                f"Export complete (map display failed: {exc}). {filepath}"
-            )
-
-    def _parse_alignment_for_map(
-        self,
-        filepath: str,
-        work_epsg: int,
-        force_positive: bool,
-    ) -> list[list[tuple[float, float]]]:
-        """
-        Read a LandXML file, extract element Start/End coordinates,
-        optionally undo the force-positive abs(), and back-project to WGS84.
-        Returns: list of (lat, lon) lists, one per Alignment.
-        """
-        from lxml import etree
-        from geometry.projection import projected_to_wgs84
-
-        NS = "http://www.landxml.org/schema/LandXML-1.2"
-
-        tree = etree.parse(filepath)
-        alignments_latlon: list[list[tuple[float, float]]] = []
-
-        for aln_el in tree.findall(f".//{{{NS}}}Alignment"):
-            coord_geom = aln_el.find(f"{{{NS}}}CoordGeom")
-            if coord_geom is None:
-                continue
-
-            pts_xy: list[tuple[float, float]] = []
-            last_end: tuple[float, float] | None = None
-
-            for el in coord_geom:
-                # Start point of each element
-                start_el = el.find(f"{{{NS}}}Start")
-                if start_el is not None and start_el.text:
-                    y_str, x_str = start_el.text.strip().split()
-                    x, y = float(x_str), float(y_str)
-                    if force_positive:
-                        x, y = -abs(x), -abs(y)
-                    pts_xy.append((x, y))
-
-                end_el = el.find(f"{{{NS}}}End")
-                if end_el is not None and end_el.text:
-                    y_str, x_str = end_el.text.strip().split()
-                    x, y = float(x_str), float(y_str)
-                    if force_positive:
-                        x, y = -abs(x), -abs(y)
-                    last_end = (x, y)
-
-            if last_end:
-                pts_xy.append(last_end)
-
-            if len(pts_xy) >= 2:
-                latlon = projected_to_wgs84(pts_xy, work_epsg)
-                alignments_latlon.append(latlon)
-
-        return alignments_latlon
+        # alignment_ready signal from step4 already triggered map display
+        self.statusBar().showMessage(
+            f"Export complete — alignment shown on map (red line). {filepath}"
+        )
 
     # ------------------------------------------------------------------
     # Start over
     # ------------------------------------------------------------------
 
     def _start_over(self):
-        """Reset all state and return to Step 1 for a new railway search."""
-        self._tracks = []
-        self._selected_tracks = []
-        self._settings = {}
+        self._tracks           = []
+        self._selected_tracks  = []
+        self._settings         = {}
         self.map_widget.clear_all()
         self.sidebar.reset()
         self._goto_step(0)
         self.statusBar().showMessage(
-            "Ready. Search for a new railway or draw a bbox on the map."
+            "Ready. Search for a new railway or use 'Lines in View'."
         )

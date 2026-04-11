@@ -1,6 +1,15 @@
 """
 Map widget: QWebEngineView hosting a Leaflet.js map.
-Python ↔ JavaScript communication via QWebChannel.
+Python ↔ JavaScript via QWebChannel.
+
+Tiles:
+  Dark  — CARTO Dark Matter base + OpenRailwayMap overlay (coloured railways)
+  Light — CARTO Voyager base   + OpenRailwayMap overlay
+
+Custom Leaflet panes keep the alignment overlay on top of tracks:
+  tracksPane        zIndex 410
+  alignmentGlowPane zIndex 640
+  alignmentPane     zIndex 650  ← exported line, always visible
 """
 
 from __future__ import annotations
@@ -11,16 +20,15 @@ from collections import deque
 from PySide6.QtCore import QObject, Signal, Slot, QUrl
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QToolBar, QPushButton, QSizePolicy
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QSizePolicy
 
 # ---------------------------------------------------------------------------
-# Track colours (cycle)
+# Track colours
 # ---------------------------------------------------------------------------
 TRACK_COLORS = [
     "#4fc3f7", "#81c784", "#ffb74d", "#e57373",
     "#ce93d8", "#80cbc4", "#fff176", "#ff8a65",
 ]
-
 
 # ---------------------------------------------------------------------------
 # Inline HTML / JavaScript
@@ -31,7 +39,7 @@ MAP_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8"/>
 <style>
-  html, body, #map { width:100%; height:100%; margin:0; padding:0; background:#1a1a1a; }
+  html, body, #map { width:100%; height:100%; margin:0; padding:0; }
 </style>
 <link rel="stylesheet"
       href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css"/>
@@ -43,84 +51,78 @@ MAP_HTML = r"""<!DOCTYPE html>
 <script>
 var map = L.map('map', {zoomControl: true}).setView([50.05, 14.42], 7);
 
-/* CARTO Dark tiles — free for embedded apps, no 403 issues */
-L.tileLayer(
-  'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-  {
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+/* Custom panes for z-ordering */
+map.createPane('tracksPane').style.zIndex      = 410;
+map.createPane('alignmentGlowPane').style.zIndex = 640;
+map.createPane('alignmentPane').style.zIndex   = 650;
+
+var baseLayer      = null;
+var railOverlay    = null;
+var trackLayers    = [];
+var alignmentLayers = [];
+var backend        = null;
+
+/* ── Theme / tile switching ─────────────────────────────────────── */
+function setTheme(dark) {
+  if (baseLayer)   { map.removeLayer(baseLayer);   baseLayer   = null; }
+  if (railOverlay) { map.removeLayer(railOverlay); railOverlay = null; }
+
+  var tileUrl = dark
+    ? 'https://{s}.basemaps.cartocdn.com/dark_matter/{z}/{x}/{y}.png'
+    : 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png';
+  var tileAttr =
+    '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' +
+    ' &copy; <a href="https://carto.com/attributions">CARTO</a>';
+
+  baseLayer = L.tileLayer(tileUrl, {
+    attribution: tileAttr,
     subdomains: 'abcd',
     maxZoom: 20
-  }
-).addTo(map);
+  }).addTo(map);
 
-var trackLayers     = [];
-var alignmentLayers = [];
-var bboxLayer       = null;
-var bboxMode        = false;
-var bboxStart       = null;
-var backend         = null;
+  /* OpenRailwayMap — colours railways by type/status */
+  railOverlay = L.tileLayer(
+    'https://{s}.tiles.openrailwaymap.org/standard/{z}/{x}/{y}.png',
+    {
+      attribution: '&copy; <a href="https://www.openrailwaymap.org/">OpenRailwayMap</a>',
+      subdomains: 'abc',
+      maxZoom: 19,
+      opacity: dark ? 0.85 : 0.65
+    }
+  ).addTo(map);
+}
 
-/* ---- QWebChannel bootstrap ---- */
+/* ── QWebChannel bootstrap ────────────────────────────────────────*/
 new QWebChannel(qt.webChannelTransport, function(channel) {
   backend = channel.objects.backend;
   backend.on_ready();
 });
 
-/* ---- Bbox drawing ---- */
-function setBboxMode(enabled) {
-  bboxMode = enabled;
-  if (enabled) {
-    map.dragging.disable();
-    map.getContainer().style.cursor = 'crosshair';
-  } else {
-    map.dragging.enable();
-    map.getContainer().style.cursor = '';
-  }
+/* ── Map bounds (for "search in view") ───────────────────────────*/
+function getMapBounds() {
+  var b = map.getBounds();
+  if (backend) backend.on_bounds_ready(b.getSouth(), b.getWest(), b.getNorth(), b.getEast());
 }
 
-map.on('mousedown', function(e) {
-  if (!bboxMode) return;
-  bboxStart = e.latlng;
-  if (bboxLayer) { map.removeLayer(bboxLayer); bboxLayer = null; }
-});
-
-map.on('mousemove', function(e) {
-  if (!bboxMode || !bboxStart) return;
-  if (bboxLayer) map.removeLayer(bboxLayer);
-  bboxLayer = L.rectangle([bboxStart, e.latlng], {
-    color: '#e67e22', weight: 2, dashArray: '6,4', fillOpacity: 0.08
-  }).addTo(map);
-});
-
-map.on('mouseup', function(e) {
-  if (!bboxMode || !bboxStart) return;
-  var end = e.latlng;
-  var s  = Math.min(bboxStart.lat, end.lat);
-  var n  = Math.max(bboxStart.lat, end.lat);
-  var w  = Math.min(bboxStart.lng, end.lng);
-  var ea = Math.max(bboxStart.lng, end.lng);
-  bboxStart = null;
-  setBboxMode(false);
-  if (backend) backend.on_bbox_drawn(s, w, n, ea);
-});
-
-/* ---- Track display ---- */
+/* ── Track display ───────────────────────────────────────────────*/
 function showTracks(jsonStr) {
   trackLayers.forEach(function(l) { map.removeLayer(l); });
   trackLayers = [];
   var tracks = JSON.parse(jsonStr);
-  var allLatLng = [];
+  var all = [];
   tracks.forEach(function(t) {
     var color   = t.color || '#4fc3f7';
     var latlngs = t.nodes.map(function(n) { return [n[0], n[1]]; });
-    allLatLng   = allLatLng.concat(latlngs);
-    var pl = L.polyline(latlngs, {color: color, weight: 3, opacity: 0.85});
+    all = all.concat(latlngs);
+    var pl = L.polyline(latlngs, {
+      color: color, weight: 3, opacity: 0.85, pane: 'tracksPane'
+    });
     pl.options._baseColor = color;
     pl.addTo(map);
     trackLayers.push(pl);
   });
-  if (allLatLng.length > 0) {
-    map.fitBounds(allLatLng, {padding: [20, 20]});
+  if (all.length > 0) {
+    map.fitBounds(L.latLngBounds(all), {padding: [20, 20]});
   }
 }
 
@@ -130,33 +132,53 @@ function highlightTrack(idx) {
     if (idx < 0) {
       l.setStyle({color: base, weight: 3, opacity: 0.85});
     } else if (i === idx) {
-      l.setStyle({color: '#ffeb3b', weight: 5, opacity: 1.0});
+      l.setStyle({color: '#ffeb3b', weight: 6, opacity: 1.0});
       l.bringToFront();
     } else {
-      l.setStyle({color: base, weight: 2, opacity: 0.4});
+      l.setStyle({color: base, weight: 2, opacity: 0.3});
     }
   });
 }
 
-/* ---- Exported alignment overlay ---- */
+function flyToTracks() {
+  if (trackLayers.length === 0) return;
+  var all = [];
+  trackLayers.forEach(function(l) { all = all.concat(l.getLatLngs()); });
+  if (all.length > 0)
+    map.flyToBounds(L.latLngBounds(all), {padding: [30, 30], duration: 0.8});
+}
+
+/* ── Exported alignment overlay ──────────────────────────────────*/
 function showAlignment(jsonStr) {
-  alignmentLayers.forEach(function(l) { map.removeLayer(l); });
-  alignmentLayers = [];
+  clearAlignment();
   var alns = JSON.parse(jsonStr);
-  var allLatLng = [];
+  var all  = [];
   alns.forEach(function(aln) {
     var latlngs = aln.nodes.map(function(n) { return [n[0], n[1]]; });
     if (latlngs.length < 2) return;
-    allLatLng = allLatLng.concat(latlngs);
-    var pl = L.polyline(latlngs, {
-      color: '#ff4081', weight: 4, opacity: 1.0, dashArray: '10,5'
-    });
-    pl.addTo(map);
-    alignmentLayers.push(pl);
+    all = all.concat(latlngs);
+    /* Glow: wide semi-transparent halo */
+    var glow = L.polyline(latlngs, {
+      color: '#ffffff', weight: 12, opacity: 0.25, pane: 'alignmentGlowPane'
+    }).addTo(map);
+    /* Solid bright red line on top */
+    var bright = L.polyline(latlngs, {
+      color: '#ff1744', weight: 4, opacity: 1.0, pane: 'alignmentPane'
+    }).addTo(map);
+    alignmentLayers.push(glow, bright);
   });
-  if (allLatLng.length > 0) {
-    map.fitBounds(allLatLng, {padding: [30, 30]});
-  }
+  if (all.length > 0)
+    map.flyToBounds(L.latLngBounds(all), {padding: [30, 30], duration: 0.8});
+}
+
+function flyToAlignment() {
+  if (alignmentLayers.length === 0) return;
+  var all = [];
+  alignmentLayers.forEach(function(l) {
+    try { all = all.concat(l.getLatLngs()); } catch(e) {}
+  });
+  if (all.length > 0)
+    map.flyToBounds(L.latLngBounds(all), {padding: [30, 30], duration: 0.8});
 }
 
 function clearAlignment() {
@@ -164,14 +186,9 @@ function clearAlignment() {
   alignmentLayers = [];
 }
 
-function clearBbox() {
-  if (bboxLayer) { map.removeLayer(bboxLayer); bboxLayer = null; }
-}
-
 function clearAll() {
   showTracks('[]');
   clearAlignment();
-  clearBbox();
 }
 </script>
 </body>
@@ -180,21 +197,16 @@ function clearAll() {
 
 
 # ---------------------------------------------------------------------------
-# Python ↔ JS bridge object
+# Python ↔ JS bridge
 # ---------------------------------------------------------------------------
 
 class MapBridge(QObject):
-    bbox_drawn  = Signal(float, float, float, float)  # s, w, n, e
-    map_clicked = Signal(float, float)
-    ready       = Signal()
+    bounds_ready = Signal(float, float, float, float)  # s, w, n, e
+    ready        = Signal()
 
     @Slot(float, float, float, float)
-    def on_bbox_drawn(self, s: float, w: float, n: float, e: float):
-        self.bbox_drawn.emit(s, w, n, e)
-
-    @Slot(float, float)
-    def on_map_clicked(self, lat: float, lon: float):
-        self.map_clicked.emit(lat, lon)
+    def on_bounds_ready(self, s: float, w: float, n: float, e: float):
+        self.bounds_ready.emit(s, w, n, e)
 
     @Slot()
     def on_ready(self):
@@ -206,14 +218,16 @@ class MapBridge(QObject):
 # ---------------------------------------------------------------------------
 
 class MapWidget(QWidget):
-    bbox_drawn           = Signal(float, float, float, float)
-    bbox_search_requested = Signal(float, float, float, float)
+    """Leaflet map hosted inside a QWebEngineView."""
+
+    bounds_ready = Signal(float, float, float, float)   # s, w, n, e
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        from gui.theme import is_dark_mode
+        self._dark = is_dark_mode()
         self._map_ready = False
         self._js_queue: deque[str] = deque()
-        self._last_bbox: tuple | None = None
         self._build()
 
     def _build(self):
@@ -221,41 +235,18 @@ class MapWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Toolbar
-        toolbar = QToolBar()
-        toolbar.setMovable(False)
-
-        self._bbox_btn = QPushButton("✏  Draw bbox")
-        self._bbox_btn.setCheckable(True)
-        self._bbox_btn.setToolTip("Click and drag to draw a search bounding box")
-        self._bbox_btn.clicked.connect(self._toggle_bbox_mode)
-        toolbar.addWidget(self._bbox_btn)
-
-        # "Find railways" button — appears after bbox is drawn
-        self._find_btn = QPushButton("🔍  Search Railways in Bbox")
-        self._find_btn.setVisible(False)
-        self._find_btn.setStyleSheet(
-            "QPushButton { background:#d35400; color:#fff; border-radius:3px; padding:4px 10px; }"
-            "QPushButton:hover { background:#e67e22; }"
-        )
-        self._find_btn.setToolTip("Run an Overpass query for all railway lines inside the drawn box")
-        self._find_btn.clicked.connect(self._on_find_btn_clicked)
-        toolbar.addWidget(self._find_btn)
-
-        layout.addWidget(toolbar)
-
-        # WebEngine
         self._view = QWebEngineView()
-        self._view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._view.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
 
-        # Channel + bridge
-        self._bridge = MapBridge()
+        self._bridge  = MapBridge()
         self._channel = QWebChannel()
         self._channel.registerObject("backend", self._bridge)
         self._view.page().setWebChannel(self._channel)
 
         self._bridge.ready.connect(self._on_map_ready)
-        self._bridge.bbox_drawn.connect(self._on_bbox_drawn_internal)
+        self._bridge.bounds_ready.connect(self.bounds_ready)
 
         self._view.setHtml(MAP_HTML, QUrl("qrc:///"))
         layout.addWidget(self._view)
@@ -266,6 +257,10 @@ class MapWidget(QWidget):
 
     def _on_map_ready(self):
         self._map_ready = True
+        # Set initial theme first, then flush queued calls
+        self._view.page().runJavaScript(
+            f"setTheme({'true' if self._dark else 'false'})"
+        )
         while self._js_queue:
             self._view.page().runJavaScript(self._js_queue.popleft())
 
@@ -275,58 +270,49 @@ class MapWidget(QWidget):
         else:
             self._js_queue.append(js)
 
-    def _toggle_bbox_mode(self, checked: bool):
-        self._run_js(f"setBboxMode({'true' if checked else 'false'})")
-        if not checked:
-            self._run_js("clearBbox()")
-
-    def _on_bbox_drawn_internal(self, s: float, w: float, n: float, e: float):
-        self._bbox_btn.setChecked(False)
-        self._last_bbox = (s, w, n, e)
-        self._find_btn.setVisible(True)
-        self.bbox_drawn.emit(s, w, n, e)
-
-    def _on_find_btn_clicked(self):
-        if self._last_bbox:
-            self.bbox_search_requested.emit(*self._last_bbox)
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
+    def set_theme(self, dark: bool):
+        """Switch base tiles and OpenRailwayMap opacity for dark/light mode."""
+        self._dark = dark
+        self._run_js(f"setTheme({'true' if dark else 'false'})")
+
     def show_tracks(self, tracks):
-        payload = []
-        for i, t in enumerate(tracks):
-            payload.append({
+        payload = [
+            {
                 "nodes": [[n[0], n[1]] for n in t.nodes],
                 "color": TRACK_COLORS[i % len(TRACK_COLORS)],
                 "name":  t.name,
-            })
+            }
+            for i, t in enumerate(tracks)
+        ]
         self._run_js(f"showTracks({json.dumps(payload)})")
 
     def highlight_track(self, idx: int):
         self._run_js(f"highlightTrack({idx})")
 
-    def show_alignment(self, alignments_latlon: list[list[tuple]]):
-        """Draw exported LandXML alignment as a dashed pink overlay."""
-        payload = [{"nodes": [[lat, lon] for lat, lon in aln]}
-                   for aln in alignments_latlon]
+    def fly_to_tracks(self):
+        self._run_js("flyToTracks()")
+
+    def show_alignment(self, alignments: list):
+        """
+        alignments: list of node lists.
+        Each node list is [[lat, lon], ...] — one per exported alignment/track.
+        """
+        payload = [{"nodes": nodes} for nodes in alignments]
         self._run_js(f"showAlignment({json.dumps(payload)})")
+
+    def fly_to_alignment(self):
+        self._run_js("flyToAlignment()")
 
     def clear_alignment(self):
         self._run_js("clearAlignment()")
 
-    def set_bbox_mode(self, enabled: bool):
-        self._bbox_btn.setChecked(enabled)
-        self._run_js(f"setBboxMode({'true' if enabled else 'false'})")
-
-    def clear_bbox(self):
-        self._run_js("clearBbox()")
-        self._bbox_btn.setChecked(False)
+    def request_bounds(self):
+        """Ask the map for its current view bounds; result arrives via bounds_ready."""
+        self._run_js("getMapBounds()")
 
     def clear_all(self):
-        """Remove all tracks, alignment overlay and bbox rectangle."""
         self._run_js("clearAll()")
-        self._find_btn.setVisible(False)
-        self._last_bbox = None
-        self._bbox_btn.setChecked(False)
