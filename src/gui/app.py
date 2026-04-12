@@ -109,6 +109,7 @@ class App(QMainWindow):
         self.step3.config_confirmed.connect(self._on_config_confirmed)
 
         # Step 4 → alignment display / fit / export / restart
+        self.step4.osm_track_ready.connect(self._on_osm_track_ready)
         self.step4.alignment_ready.connect(self._on_alignment_ready)
         self.step4.fit_to_alignment_requested.connect(self._on_fit_to_alignment)
         self.step4.export_finished.connect(self._on_export_finished)
@@ -166,6 +167,14 @@ class App(QMainWindow):
     # Step 4 map interactions
     # ------------------------------------------------------------------
 
+    def _on_osm_track_ready(self, alignments: list):
+        """Show the raw OSM polyline as a dashed cyan reference while fitting runs."""
+        if alignments and any(len(a) > 0 for a in alignments):
+            self.map_widget.show_osm_reference(alignments)
+            self.statusBar().showMessage(
+                "OSM reference polyline drawn (dashed cyan). Fitting geometry…"
+            )
+
     def _on_alignment_ready(self, alignments: list):
         if not alignments or not any(len(a) > 0 for a in alignments):
             self.statusBar().showMessage(
@@ -176,8 +185,8 @@ class App(QMainWindow):
         self.map_widget.show_alignment(alignments)
         total_pts = sum(len(a) for a in alignments)
         self.statusBar().showMessage(
-            f"Exported alignment drawn on map (bright red) — "
-            f"{len(alignments)} track(s), {total_pts} points."
+            f"Both overlays ready — 🔴 red: fitted LandXML ({total_pts} pts)  "
+            f"🔵 cyan dashed: OSM reference  ({len(alignments)} track(s))."
         )
 
     def _on_fit_to_alignment(self):
@@ -316,7 +325,7 @@ class App(QMainWindow):
         self._tracks           = []
         self._selected_tracks  = []
         self._settings         = {}
-        self.map_widget.clear_all()
+        self.map_widget.clear_all()   # clears tracks + cyan OSM ref + red alignment
         self.sidebar.reset()
         self._goto_step(0)
         self.statusBar().showMessage(

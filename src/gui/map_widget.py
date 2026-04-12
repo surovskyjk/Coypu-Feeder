@@ -109,12 +109,14 @@ var map = L.map('map', {zoomControl: true}).setView([50.05, 14.42], 7);
 
 /* Custom panes for z-ordering */
 map.createPane('tracksPane').style.zIndex      = '410';
+map.createPane('osmRefPane').style.zIndex      = '630';
 map.createPane('alignmentGlowPane').style.zIndex = '640';
 map.createPane('alignmentPane').style.zIndex   = '650';
 
 var baseLayer       = null;
 var railOverlay     = null;
 var trackLayers     = [];
+var osmRefLayers    = [];
 var alignmentLayers = [];
 var backend         = null;
 var _showRailOverlay = true;
@@ -199,7 +201,26 @@ function flyToTracks() {
     try { map.flyToBounds(L.latLngBounds(all), {padding:[30,30], duration:0.8, maxZoom:14}); } catch(e){}
 }
 
-/* ── Alignment overlay ──────────────────────────────────────────  */
+/* ── OSM reference overlay (dashed cyan) ────────────────────────  */
+function showOSMReference(alns) {
+  clearOSMReference();
+  alns.forEach(function(aln) {
+    var latlngs = aln.nodes.map(function(n){ return [n[0],n[1]]; });
+    if (latlngs.length < 2) return;
+    var pl = L.polyline(latlngs, {
+      color: '#00e5ff', weight: 3, opacity: 0.85,
+      dashArray: '8 6', pane: 'osmRefPane'
+    }).addTo(map);
+    osmRefLayers.push(pl);
+  });
+}
+
+function clearOSMReference() {
+  osmRefLayers.forEach(function(l){ try{ map.removeLayer(l); }catch(e){} });
+  osmRefLayers = [];
+}
+
+/* ── Fitted alignment overlay (solid red) ───────────────────────  */
 function showAlignment(alns) {
   clearAlignment();
   var all = [];
@@ -229,6 +250,7 @@ function clearAlignment() {
 
 function clearAll() {
   showTracks([]);
+  clearOSMReference();
   clearAlignment();
 }
 </script>
@@ -461,6 +483,14 @@ class MapWidget(QWidget):
     def fly_to_tracks(self):
         self._run_js("flyToTracks()")
 
+    def show_osm_reference(self, alignments: list):
+        """Draw the raw OSM polyline as a dashed cyan reference overlay."""
+        payload = [{"nodes": nodes} for nodes in alignments]
+        self._run_js(f"showOSMReference({json.dumps(payload)})")
+
+    def clear_osm_reference(self):
+        self._run_js("clearOSMReference()")
+
     def show_alignment(self, alignments: list):
         payload = [{"nodes": nodes} for nodes in alignments]
         self._run_js(f"showAlignment({json.dumps(payload)})")
@@ -475,4 +505,4 @@ class MapWidget(QWidget):
         self._run_js("getMapBounds()")
 
     def clear_all(self):
-        self._run_js("clearAll()")
+        self._run_js("clearAll()")   # clears tracks + osmRef + alignment

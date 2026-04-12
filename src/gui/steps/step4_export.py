@@ -26,10 +26,11 @@ STAGE_PCT = {
 
 class Step4Export(QWidget):
     # Emitted after successful export
-    export_finished          = Signal(str, int)   # filepath, work_epsg
-    alignment_ready          = Signal(list)        # [[lat,lon],...] per track
+    export_finished            = Signal(str, int)  # filepath, work_epsg
+    osm_track_ready            = Signal(list)      # raw OSM [[lat,lon],...] per track
+    alignment_ready            = Signal(list)      # reconstructed geometric points
     fit_to_alignment_requested = Signal()
-    start_over_requested     = Signal()
+    start_over_requested       = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -86,7 +87,11 @@ class Step4Export(QWidget):
         sep.setStyleSheet("color:#555;")
         pv.addWidget(sep)
 
-        ok_lbl = QLabel("✅  Exported alignment drawn on map (bright red).")
+        ok_lbl = QLabel(
+            "✅  Both overlays drawn on map:\n"
+            "  🔴 Red solid  — fitted LandXML alignment\n"
+            "  🔵 Cyan dashed — original OSM polyline"
+        )
         ok_lbl.setStyleSheet("color:#8bc34a; font-size:10px;")
         ok_lbl.setWordWrap(True)
         pv.addWidget(ok_lbl)
@@ -161,7 +166,8 @@ class Step4Export(QWidget):
         self._worker = ExportWorker(self._tracks, self._settings, filepath, self)
         self._worker.stage_changed.connect(self._on_stage)
         self._worker.station_progress.connect(self._on_station_progress)
-        self._worker.alignment_ready.connect(self.alignment_ready.emit)  # forward
+        self._worker.osm_track_ready.connect(self.osm_track_ready.emit)   # forward
+        self._worker.alignment_ready.connect(self.alignment_ready.emit)   # forward
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
         self._worker.start()

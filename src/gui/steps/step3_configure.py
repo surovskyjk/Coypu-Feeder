@@ -143,6 +143,19 @@ class Step3Configure(QWidget):
         )
         af.addRow("Max deviation from OSM line:", self._max_dev_spin)
 
+        self._min_radius_spin = QDoubleSpinBox()
+        self._min_radius_spin.setRange(50.0, 10000.0)
+        self._min_radius_spin.setSingleStep(25.0)
+        self._min_radius_spin.setDecimals(0)
+        self._min_radius_spin.setValue(150.0)
+        self._min_radius_spin.setSuffix(" m")
+        self._min_radius_spin.setToolTip(
+            "Minimum horizontal curve radius enforced on all arc elements.\n"
+            "Mainline railway: ≥ 300 m  |  Secondary line: ≥ 150 m\n"
+            "Tramway / light rail: 50–100 m  |  High-speed rail: ≥ 1500 m"
+        )
+        af.addRow("Minimum curve radius:", self._min_radius_spin)
+
         self._check_interval_spin = QDoubleSpinBox()
         self._check_interval_spin.setRange(1.0, 50.0)
         self._check_interval_spin.setSingleStep(1.0)
@@ -222,4 +235,5 @@ class Step3Configure(QWidget):
             "force_positive":   self._force_pos_chk.isChecked(),
             "max_deviation":    self._max_dev_spin.value(),
             "check_interval":   self._check_interval_spin.value(),
+            "min_radius":       self._min_radius_spin.value(),
         })
