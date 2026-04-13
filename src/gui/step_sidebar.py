@@ -1,5 +1,5 @@
 """
-4-step numbered sidebar, always visible.
+6-step numbered sidebar, always visible.
 Clicking a completed step navigates back.
 """
 
@@ -14,7 +14,9 @@ STEPS = [
     ("1", "Find Railway"),
     ("2", "Select Section"),
     ("3", "Configure"),
-    ("4", "Export"),
+    ("4", "Candidates"),
+    ("5", "Refine"),
+    ("6", "Export"),
 ]
 
 

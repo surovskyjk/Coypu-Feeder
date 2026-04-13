@@ -19,7 +19,9 @@ from .step_sidebar import StepSidebar
 from .steps.step1_find import Step1Find
 from .steps.step2_section import Step2Section
 from .steps.step3_configure import Step3Configure
-from .steps.step4_export import Step4Export
+from .steps.step4_candidates import Step4Candidates
+from .steps.step5_refine import Step5Refine
+from .steps.step6_export import Step6Export
 
 # Maximum map-view span (km) allowed for "search in view"
 _MAX_VIEW_KM = 20.0
@@ -36,6 +38,11 @@ class App(QMainWindow):
         self._selected_tracks: list = []
         self._settings: dict        = {}
         self._bbox_workers: list    = []
+        self._selected_candidate    = None
+        self._final_elements: list  = []
+        self._xy_list: list         = []
+        self._chainages_list: list  = []
+        self._work_epsg: int        = 32633
 
         self._build_layout()
         self._wire_signals()
@@ -65,15 +72,19 @@ class App(QMainWindow):
         self.stack = QStackedWidget()
         self.stack.setFixedWidth(340)
 
-        self.step1 = Step1Find()
-        self.step2 = Step2Section()
-        self.step3 = Step3Configure()
-        self.step4 = Step4Export()
+        self.step1              = Step1Find()
+        self.step2              = Step2Section()
+        self.step3              = Step3Configure()
+        self.step4_candidates   = Step4Candidates()
+        self.step5_refine       = Step5Refine()
+        self.step6_export       = Step6Export()
 
-        self.stack.addWidget(self.step1)   # 0
-        self.stack.addWidget(self.step2)   # 1
-        self.stack.addWidget(self.step3)   # 2
-        self.stack.addWidget(self.step4)   # 3
+        self.stack.addWidget(self.step1)            # 0
+        self.stack.addWidget(self.step2)            # 1
+        self.stack.addWidget(self.step3)            # 2
+        self.stack.addWidget(self.step4_candidates) # 3
+        self.stack.addWidget(self.step5_refine)     # 4
+        self.stack.addWidget(self.step6_export)     # 5
 
         h.addWidget(self.stack)
         self.statusBar().showMessage(
@@ -108,12 +119,20 @@ class App(QMainWindow):
         # Step 3 → config confirmed
         self.step3.config_confirmed.connect(self._on_config_confirmed)
 
-        # Step 4 → alignment display / fit / export / restart
-        self.step4.osm_track_ready.connect(self._on_osm_track_ready)
-        self.step4.alignment_ready.connect(self._on_alignment_ready)
-        self.step4.fit_to_alignment_requested.connect(self._on_fit_to_alignment)
-        self.step4.export_finished.connect(self._on_export_finished)
-        self.step4.start_over_requested.connect(self._start_over)
+        # Step 4 (candidates) → map update + selection
+        self.step4_candidates.candidate_map_update.connect(self._on_candidate_map_update)
+        self.step4_candidates.candidate_selected.connect(self._on_candidate_selected)
+
+        # Step 5 (refine) → done / back
+        self.step5_refine.refinement_done.connect(self._on_refinement_done)
+        self.step5_refine.back_requested.connect(lambda: self._goto_step(3))
+
+        # Step 6 (export) → alignment display / fit / export / restart
+        self.step6_export.osm_track_ready.connect(self._on_osm_track_ready)
+        self.step6_export.alignment_ready.connect(self._on_alignment_ready)
+        self.step6_export.fit_to_alignment_requested.connect(self._on_fit_to_alignment)
+        self.step6_export.export_finished.connect(self._on_export_finished)
+        self.step6_export.start_over_requested.connect(self._start_over)
 
     # ------------------------------------------------------------------
     # System colour-scheme changes (dark ↔ light)
@@ -164,7 +183,7 @@ class App(QMainWindow):
             self.statusBar().showMessage("No tracks loaded yet.")
 
     # ------------------------------------------------------------------
-    # Step 4 map interactions
+    # Step 6 map interactions
     # ------------------------------------------------------------------
 
     def _on_osm_track_ready(self, alignments: list):
@@ -296,23 +315,95 @@ class App(QMainWindow):
         self._goto_step(2)
 
     # ------------------------------------------------------------------
-    # Config confirmed
+    # Config confirmed → project coordinates + launch candidate worker
     # ------------------------------------------------------------------
 
     def _on_config_confirmed(self, settings: dict):
+        from geometry.projection import wgs84_to_projected, auto_utm_epsg
+        from geometry.curvature import compute_chainages
+        import numpy as np
+
         self._settings = settings
-        self.step4.prepare(self._selected_tracks, settings)
+        epsg       = settings["epsg"]
+        work_epsg  = epsg if epsg != -1 else auto_utm_epsg(self._selected_tracks[0].nodes)
+        self._work_epsg = work_epsg
+
+        force_positive = settings.get("force_positive", False)
+        xy_list        = []
+        chainages_list = []
+
+        for track in self._selected_tracks:
+            xy = np.array(wgs84_to_projected(track.nodes, work_epsg))
+            if force_positive:
+                xy = np.abs(xy)
+            xy_list.append(xy)
+            chainages_list.append(compute_chainages(xy))
+
+        self._xy_list        = xy_list
+        self._chainages_list = chainages_list
+
+        self.map_widget.clear_candidates()
+
+        self.step4_candidates.prepare(
+            self._selected_tracks, settings, xy_list, chainages_list, work_epsg
+        )
         self.statusBar().showMessage(
-            "Settings confirmed. Choose a file and click 'Start Export'."
+            "Projecting coordinates… Running candidate algorithms."
         )
         self._goto_step(3)
+
+    # ------------------------------------------------------------------
+    # Candidate map overlay update
+    # ------------------------------------------------------------------
+
+    def _on_candidate_map_update(self, candidates: list):
+        """Called each time a candidate algorithm completes — update map overlays."""
+        payload = [
+            {
+                "nodes": [[lat, lon] for lat, lon in c.geo_wgs84],
+                "color": c.color_hex,
+                "label": c.label,
+            }
+            for c in candidates
+            if c.geo_wgs84
+        ]
+        self.map_widget.show_candidates(payload)
+
+    # ------------------------------------------------------------------
+    # Candidate selected → go to Step 5
+    # ------------------------------------------------------------------
+
+    def _on_candidate_selected(self, candidate):
+        self._selected_candidate = candidate
+        # Clear candidate overlays; Step 5 will show the chosen one
+        self.map_widget.clear_candidates()
+        xy        = self._xy_list[0]        if self._xy_list        else None
+        chainages = self._chainages_list[0] if self._chainages_list else None
+        self.step5_refine.prepare(candidate, xy, chainages, self._settings)
+        self.statusBar().showMessage(
+            f"Candidate '{getattr(candidate, 'label', '')}' selected. "
+            "Optionally refine spiral transitions, then Accept."
+        )
+        self._goto_step(4)
+
+    # ------------------------------------------------------------------
+    # Refinement done → go to Step 6
+    # ------------------------------------------------------------------
+
+    def _on_refinement_done(self, elements: list):
+        self._final_elements = elements
+        self.step6_export.prepare(elements, self._selected_tracks, self._settings)
+        self.statusBar().showMessage(
+            "Refinement complete. Choose a file and click 'Start Export'."
+        )
+        self._goto_step(5)
 
     # ------------------------------------------------------------------
     # Export finished
     # ------------------------------------------------------------------
 
     def _on_export_finished(self, filepath: str, work_epsg: int):
-        # alignment_ready signal from step4 already triggered map display via _on_alignment_ready
+        # alignment_ready signal from step6 already triggered map display
         self.statusBar().showMessage(
             f"✓ Export complete (EPSG:{work_epsg}) — alignment shown on map. {filepath}"
         )
@@ -322,10 +413,14 @@ class App(QMainWindow):
     # ------------------------------------------------------------------
 
     def _start_over(self):
-        self._tracks           = []
-        self._selected_tracks  = []
-        self._settings         = {}
-        self.map_widget.clear_all()   # clears tracks + cyan OSM ref + red alignment
+        self._tracks             = []
+        self._selected_tracks    = []
+        self._settings           = {}
+        self._selected_candidate = None
+        self._final_elements     = []
+        self._xy_list            = []
+        self._chainages_list     = []
+        self.map_widget.clear_all()   # clears tracks + cyan OSM ref + red alignment + candidates
         self.sidebar.reset()
         self._goto_step(0)
         self.statusBar().showMessage(

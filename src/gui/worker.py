@@ -82,6 +82,70 @@ class FetchWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
+# Candidate worker
+# ---------------------------------------------------------------------------
+
+class CandidateWorker(QThread):
+    """
+    Runs all three candidate alignment algorithms sequentially in the background.
+
+    Signals
+    -------
+    candidate_ready(str, object)   algorithm_id, CandidateAlignment
+    all_done()                     all algorithms finished
+    failed(str)                    fatal error message
+    """
+    candidate_ready = Signal(str, object)
+    all_done        = Signal()
+    failed          = Signal(str)
+
+    def __init__(self, xy_list, chainages_list, settings: dict, parent=None):
+        super().__init__(parent)
+        self._xy_list        = xy_list        # list of np.ndarray
+        self._chainages_list = chainages_list # list of np.ndarray
+        self._settings       = settings
+
+    def run(self):
+        try:
+            from geometry.candidates import CandidateGenerator, CandidateAlignment
+            from geometry.projection import projected_to_wgs84
+            from geometry.alignment import reconstruct_alignment_projected
+
+            # Use first track only for candidate generation (multi-track is Phase F)
+            xy        = self._xy_list[0]
+            chs       = self._chainages_list[0]
+            work_epsg = self._settings.get("_work_epsg", 32633)
+
+            gen = CandidateGenerator(xy, chs, self._settings)
+
+            for algo_id, color in zip(
+                ["curvature", "ransac", "greedy"],
+                ["#ff9800",   "#66bb6a", "#42a5f5"],
+            ):
+                try:
+                    c = gen._run_one(algo_id)
+                    c.color_hex = color
+                    # Compute dense WGS84 points for map display
+                    if c.elements:
+                        geo_xy    = reconstruct_alignment_projected(c.elements, sample_interval=5.0)
+                        c.geo_wgs84 = projected_to_wgs84(geo_xy, work_epsg)
+                    else:
+                        c.geo_wgs84 = []
+                except Exception:
+                    c = CandidateAlignment(
+                        algorithm_id=algo_id,
+                        label=gen.LABELS.get(algo_id, algo_id),
+                        elements=[],
+                        color_hex=color,
+                    )
+                self.candidate_ready.emit(algo_id, c)
+
+            self.all_done.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+# ---------------------------------------------------------------------------
 # Export worker
 # ---------------------------------------------------------------------------
 

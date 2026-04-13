@@ -110,6 +110,7 @@ var map = L.map('map', {zoomControl: true}).setView([50.05, 14.42], 7);
 /* Custom panes for z-ordering */
 map.createPane('tracksPane').style.zIndex      = '410';
 map.createPane('osmRefPane').style.zIndex      = '630';
+map.createPane('candidatesPane').style.zIndex  = '620';
 map.createPane('alignmentGlowPane').style.zIndex = '640';
 map.createPane('alignmentPane').style.zIndex   = '650';
 
@@ -118,6 +119,7 @@ var railOverlay     = null;
 var trackLayers     = [];
 var osmRefLayers    = [];
 var alignmentLayers = [];
+var candidateLayers = [];
 var backend         = null;
 var _showRailOverlay = true;
 
@@ -248,10 +250,39 @@ function clearAlignment() {
   alignmentLayers = [];
 }
 
+/* ── Candidate overlays (one per algorithm) ──────────────────── */
+function showCandidates(candidates) {
+  clearCandidates();
+  candidates.forEach(function(c) {
+    var latlngs = c.nodes.map(function(n){ return [n[0], n[1]]; });
+    if (latlngs.length < 2) return;
+    /* Glow */
+    L.polyline(latlngs, {color:'#ffffff', weight:10, opacity:0.15,
+                          pane:'candidatesPane'}).addTo(map);
+    /* Main line */
+    var pl = L.polyline(latlngs, {
+      color:   c.color || '#ffffff',
+      weight:  4,
+      opacity: 0.9,
+      pane:    'candidatesPane'
+    }).addTo(map);
+    pl.bindTooltip(c.label || '', {sticky: true});
+    candidateLayers.push(pl);
+  });
+}
+
+function clearCandidates() {
+  candidateLayers.forEach(function(l){
+    try{ map.removeLayer(l); }catch(e){}
+  });
+  candidateLayers = [];
+}
+
 function clearAll() {
   showTracks([]);
   clearOSMReference();
   clearAlignment();
+  clearCandidates();
 }
 </script>
 </body>
@@ -504,5 +535,19 @@ class MapWidget(QWidget):
     def request_bounds(self):
         self._run_js("getMapBounds()")
 
+    def show_candidates(self, candidates: list):
+        """
+        Show multiple candidate alignments as coloured polylines.
+
+        Parameters
+        ----------
+        candidates : list of dicts with keys: nodes [[lat,lon],...], color, label
+        """
+        self._run_js(f"showCandidates({json.dumps(candidates)})")
+
+    def clear_candidates(self):
+        """Remove all candidate alignment overlays."""
+        self._run_js("clearCandidates()")
+
     def clear_all(self):
-        self._run_js("clearAll()")   # clears tracks + osmRef + alignment
+        self._run_js("clearAll()")   # clears tracks + osmRef + alignment + candidates
