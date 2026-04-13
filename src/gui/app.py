@@ -126,9 +126,12 @@ class App(QMainWindow):
         self.step4_candidates.candidate_selected.connect(self._on_candidate_selected)
         self.step4_candidates.back_requested.connect(self._on_candidates_back)
 
-        # Step 5 (refine) → done / back
+        # Step 5 (refine) → done / back / live map update
         self.step5_refine.refinement_done.connect(self._on_refinement_done)
         self.step5_refine.back_requested.connect(self._on_refine_back)
+        self.step5_refine.alignment_update_requested.connect(
+            self._on_refine_alignment_update
+        )
 
         # Step 6 (export) → back
         self.step6_export.back_requested.connect(lambda: self._goto_step(4))
@@ -409,6 +412,25 @@ class App(QMainWindow):
         self.map_widget.clear_alignment()
         self.map_widget.clear_osm_reference()
         self._goto_step(2)
+
+    def _on_refine_alignment_update(self, elements: list):
+        """Live map update from Step 5 when a spiral is inserted/removed."""
+        from geometry.alignment import reconstruct_alignment_projected
+        from geometry.projection import projected_to_wgs84
+
+        if not elements or not self._xy_list:
+            return
+        try:
+            geo_xy     = reconstruct_alignment_projected(elements, sample_interval=5.0)
+            geo_latlon = projected_to_wgs84(geo_xy, self._work_epsg)
+            self.map_widget.show_alignment([[[lat, lon] for lat, lon in geo_latlon]])
+            n_spirals  = sum(1 for e in elements if e.get("type") == "Spiral")
+            self.statusBar().showMessage(
+                f"Alignment updated — {len(elements)} elements "
+                f"({n_spirals} spiral{'s' if n_spirals != 1 else ''})."
+            )
+        except Exception as exc:
+            self.statusBar().showMessage(f"⚠ Map update failed: {exc}")
 
     def _on_refine_back(self):
         """Go back from Refine to Candidates — restore all candidate overlays."""
