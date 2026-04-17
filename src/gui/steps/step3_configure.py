@@ -155,6 +155,27 @@ class Step3Configure(QWidget):
 
         v.addWidget(acc_group)
 
+        # ── Candidate Generation ──────────────────────────────────────
+        cand_group = QGroupBox("Candidate Generation")
+        cf = QFormLayout(cand_group)
+
+        self._merge_pct_spin = QDoubleSpinBox()
+        self._merge_pct_spin.setRange(5.0, 40.0)
+        self._merge_pct_spin.setSingleStep(5.0)
+        self._merge_pct_spin.setDecimals(0)
+        self._merge_pct_spin.setValue(15.0)
+        self._merge_pct_spin.setSuffix(" %")
+        self._merge_pct_spin.setToolTip(
+            "Controls how aggressively consecutive arcs are merged.\n"
+            "Low (5 %): many small, precise arc segments — Tight candidate.\n"
+            "High (40 %): fewer, smoother arcs — Smooth candidate.\n"
+            "The Balanced candidate uses this value directly;\n"
+            "Tight uses half of it; Smooth uses double."
+        )
+        cf.addRow("Radius merge tolerance:", self._merge_pct_spin)
+
+        v.addWidget(cand_group)
+
         v.addStretch()
         scroll.setWidget(inner)
         outer.addWidget(scroll)
@@ -196,4 +217,5 @@ class Step3Configure(QWidget):
             "max_deviation":     self._max_dev_spin.value(),
             "check_interval":    self._check_interval_spin.value(),
             "min_radius":        self._min_radius_spin.value(),
+            "merge_radius_pct":  self._merge_pct_spin.value(),
         })

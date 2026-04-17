@@ -121,8 +121,8 @@ class CandidateWorker(QThread):
             gen = CandidateGenerator(xy, chs, self._settings)
 
             for algo_id, color in zip(
-                ["curvature", "ransac", "greedy"],
-                ["#ff9800",   "#66bb6a", "#42a5f5"],
+                ["tight",    "balanced", "smooth",   "raw"],
+                ["#ff9800",  "#66bb6a",  "#42a5f5",  "#e040fb"],
             ):
                 try:
                     c = gen._run_one(algo_id)
