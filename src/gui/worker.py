@@ -17,11 +17,12 @@ from PySide6.QtCore import QThread, Signal
 
 class SearchWorker(QThread):
     """
-    mode: "ref" | "name" | "number_in_name" | "bbox"
+    mode: "ref" | "name" | "number_in_name" | "bbox" | "relation_members"
     query: str for text modes; (south, west, north, east) tuple for bbox
     """
-    results_ready = Signal(list)
-    failed        = Signal(str)
+    results_ready  = Signal(list)
+    failed         = Signal(str)
+    status_update  = Signal(str)   # live progress string (endpoint attempts, cache hit…)
 
     def __init__(self, mode: str, query, parent=None):
         super().__init__(parent)
@@ -37,18 +38,19 @@ class SearchWorker(QThread):
                 search_relations_in_bbox,
                 fetch_relation_members,
             )
+            cb = lambda msg: self.status_update.emit(msg)
             q = self._query
             if self._mode == "ref":
-                results = search_by_ref(q)
+                results = search_by_ref(q, progress_cb=cb)
             elif self._mode == "name":
-                results = search_railways_by_name(q)
+                results = search_railways_by_name(q, progress_cb=cb)
             elif self._mode == "number_in_name":
-                results = search_by_number_in_name(q)
+                results = search_by_number_in_name(q, progress_cb=cb)
             elif self._mode == "bbox":
                 s, w, n, e = q
-                results = search_relations_in_bbox(s, w, n, e)
+                results = search_relations_in_bbox(s, w, n, e, progress_cb=cb)
             elif self._mode == "relation_members":
-                results = fetch_relation_members(int(q))
+                results = fetch_relation_members(int(q), progress_cb=cb)
             else:
                 results = []
             self.results_ready.emit(results)
@@ -62,8 +64,9 @@ class SearchWorker(QThread):
 
 class FetchWorker(QThread):
     """Fetches full way/node data + metadata for a single OSM relation."""
-    data_ready = Signal(object, dict)   # (overpass_data, relation_info)
-    failed     = Signal(str)
+    data_ready    = Signal(object, dict)   # (overpass_data, relation_info)
+    failed        = Signal(str)
+    status_update = Signal(str)            # live progress string
 
     def __init__(self, relation_id: int, parent=None):
         super().__init__(parent)
@@ -72,8 +75,9 @@ class FetchWorker(QThread):
     def run(self):
         try:
             from osm.query import fetch_relation_ways, fetch_relation_metadata
-            data = fetch_relation_ways(self._rid)
-            info = fetch_relation_metadata(self._rid) or {
+            cb   = lambda msg: self.status_update.emit(msg)
+            data = fetch_relation_ways(self._rid, progress_cb=cb)
+            info = fetch_relation_metadata(self._rid, progress_cb=None) or {
                 "id": self._rid, "name": str(self._rid)
             }
             self.data_ready.emit(data, info)

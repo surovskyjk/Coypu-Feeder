@@ -25,6 +25,37 @@ from gui.worker import SearchWorker, FetchWorker
 CZ_RAILWAYS_RELATION = 2332889
 
 
+def _friendly_error(raw: str) -> str:
+    """Convert a raw exception string to a human-readable message."""
+    low = raw.lower()
+    if "429" in raw or "too many requests" in low:
+        return (
+            "Overpass API rate limit reached (HTTP 429).\n"
+            "Please wait a few minutes and try again."
+        )
+    if "timed out" in low or "timeout" in low or "read timed out" in low:
+        return (
+            "All Overpass servers timed out.\n"
+            "Check your internet connection, or try again later — "
+            "the public mirrors may be temporarily busy."
+        )
+    if "504" in raw or "gateway" in low:
+        return (
+            "Overpass gateway error (HTTP 504).\n"
+            "The server is overloaded. Try again in a minute."
+        )
+    if "connection" in low or "network" in low or "name or service not known" in low:
+        return (
+            "Could not connect to the Overpass API.\n"
+            "Please check your internet connection."
+        )
+    if "404" in raw or "not found" in low:
+        return "The requested OSM relation was not found. Please check the relation ID."
+    # Generic fallback: show raw but not a Python traceback dump
+    first_line = raw.split("\n")[0]
+    return first_line if first_line else raw
+
+
 class Step1Find(QWidget):
     railway_fetched          = Signal(object, dict)   # (overpass_data, relation_info)
     search_in_view_requested = Signal()               # → App requests map bounds
@@ -51,6 +82,15 @@ class Step1Find(QWidget):
         self._tabs.addTab(self._build_view_tab(),    "In View")
         self._tabs.addTab(self._build_cz_tab(),      "Czech Railways")
         layout.addWidget(self._tabs)
+
+        # Shared fetch-status bar (visible only while a FetchWorker is running)
+        self._fetch_status_lbl = QLabel("")
+        self._fetch_status_lbl.setStyleSheet(
+            "color:#aaa; font-size:10px; padding:2px 4px;"
+        )
+        self._fetch_status_lbl.setWordWrap(True)
+        self._fetch_status_lbl.setVisible(False)
+        layout.addWidget(self._fetch_status_lbl)
 
     # ── Search tab ────────────────────────────────────────────────────
 
@@ -259,15 +299,23 @@ class Step1Find(QWidget):
         mode = ["ref", "name", "number_in_name"][self._mode_group.checkedId()]
         worker = SearchWorker(mode, term, self)
         worker.results_ready.connect(self._on_search_results)
-        worker.failed.connect(lambda e: QMessageBox.critical(self, "Search error", e))
+        worker.failed.connect(lambda e: self._on_search_failed(e))
+        worker.status_update.connect(self._fetch_status_lbl.setText)
         worker.finished.connect(lambda: self._search_btn.setText("Search"))
         worker.finished.connect(lambda: self._search_btn.setEnabled(True))
+        worker.finished.connect(lambda: self._fetch_status_lbl.setVisible(False))
         worker.finished.connect(lambda: self._cleanup_worker(worker))
         self._workers.append(worker)
+        self._fetch_status_lbl.setText("Connecting to Overpass API…")
+        self._fetch_status_lbl.setVisible(True)
         worker.start()
 
     def _on_search_results(self, results: list):
         self._populate_list(self._results_list, results)
+
+    def _on_search_failed(self, error: str):
+        self._fetch_status_lbl.setVisible(False)
+        QMessageBox.critical(self, "Search error", _friendly_error(error))
 
     def _on_result_double_clicked(self, item: QListWidgetItem):
         r = item.data(Qt.ItemDataRole.UserRole)
@@ -310,11 +358,12 @@ class Step1Find(QWidget):
             return
         self._cz_load_btn.setEnabled(False)
         self._cz_load_btn.setText("Loading…")
-        self._cz_status.setText("Fetching list from Overpass API…")
+        self._cz_status.setText("Connecting to Overpass API…")
 
         worker = SearchWorker("relation_members", str(CZ_RAILWAYS_RELATION), self)
         worker.results_ready.connect(self._on_cz_loaded)
         worker.failed.connect(self._on_cz_load_failed)
+        worker.status_update.connect(self._cz_status.setText)
         worker.finished.connect(lambda: self._cleanup_worker(worker))
         self._workers.append(worker)
         worker.start()
@@ -331,7 +380,7 @@ class Step1Find(QWidget):
     def _on_cz_load_failed(self, error: str):
         self._cz_load_btn.setEnabled(True)
         self._cz_load_btn.setText("📥  Load Czech Railway Lines")
-        self._cz_status.setText(f"Load failed: {error}")
+        self._cz_status.setText(f"Load failed: {_friendly_error(error)}")
 
     def _apply_cz_filter(self, text: str):
         """Filter the already-loaded list client-side (no network call)."""
@@ -387,13 +436,24 @@ class Step1Find(QWidget):
 
     def _do_fetch(self, relation_id: int):
         self.setEnabled(False)
+        self._fetch_status_lbl.setText(f"Fetching relation {relation_id}…")
+        self._fetch_status_lbl.setVisible(True)
         worker = FetchWorker(relation_id, self)
         worker.data_ready.connect(self._on_data_ready)
-        worker.failed.connect(lambda e: QMessageBox.critical(self, "Fetch error", e))
+        worker.failed.connect(lambda e: self._on_fetch_failed(relation_id, e))
+        worker.status_update.connect(self._fetch_status_lbl.setText)
         worker.finished.connect(lambda: self.setEnabled(True))
+        worker.finished.connect(lambda: self._fetch_status_lbl.setVisible(False))
         worker.finished.connect(lambda: self._cleanup_worker(worker))
         self._workers.append(worker)
         worker.start()
+
+    def _on_fetch_failed(self, relation_id: int, error: str):
+        self._fetch_status_lbl.setVisible(False)
+        QMessageBox.critical(
+            self, "Fetch error",
+            f"Could not load relation {relation_id}.\n\n{_friendly_error(error)}"
+        )
 
     def _on_data_ready(self, data, info: dict):
         self.railway_fetched.emit(data, info)
