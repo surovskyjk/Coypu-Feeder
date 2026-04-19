@@ -168,6 +168,36 @@ class Step3Configure(QWidget):
         )
         cf.addRow("Max computing time:", self._time_budget_spin)
 
+        self._division_spin = QDoubleSpinBox()
+        self._division_spin.setRange(100.0, 2000.0)
+        self._division_spin.setSingleStep(100.0)
+        self._division_spin.setDecimals(0)
+        self._division_spin.setValue(500.0)
+        self._division_spin.setSuffix(" m")
+        self._division_spin.setToolTip(
+            "Length of each MC window (Progressive MC only).\n"
+            "The OSM polyline is subdivided into windows of approximately\n"
+            "this length; each window is optimised independently with C1\n"
+            "continuity enforced at every boundary.\n"
+            "Smaller windows = tighter local control, more stitching overhead.\n"
+            "Typical range: 300\u20131000 m."
+        )
+        cf.addRow("MC window length:", self._division_spin)
+
+        self._min_tangent_spin = QDoubleSpinBox()
+        self._min_tangent_spin.setRange(0.0, 200.0)
+        self._min_tangent_spin.setSingleStep(5.0)
+        self._min_tangent_spin.setDecimals(0)
+        self._min_tangent_spin.setValue(30.0)
+        self._min_tangent_spin.setSuffix(" m")
+        self._min_tangent_spin.setToolTip(
+            "Minimum length of a tangent Line element between two same-sense Arcs.\n"
+            "After Progressive MC finishes, any Line shorter than this that sits\n"
+            "between two arcs of the same rotation sense is merged into a single Arc.\n"
+            "Set to 0 to disable consolidation."
+        )
+        cf.addRow("Min tangent length:", self._min_tangent_spin)
+
         v.addWidget(cand_group)
 
         v.addStretch()
@@ -208,7 +238,9 @@ class Step3Configure(QWidget):
             "max_deviation":   self._max_dev_spin.value(),
             "min_radius":      self._min_radius_spin.value(),
             "merge_radius_pct": self._merge_pct_spin.value(),
-            "time_budget_s":   float(self._time_budget_spin.value()),
+            "time_budget_s":    float(self._time_budget_spin.value()),
+            "division_length":   self._division_spin.value(),
+            "min_tangent_length": self._min_tangent_spin.value(),
             # Keep these with defaults so downstream code that still references
             # them (e.g. old ExportWorker path) does not KeyError.
             "check_interval":  5.0,

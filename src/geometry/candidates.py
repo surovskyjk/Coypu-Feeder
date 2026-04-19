@@ -170,8 +170,10 @@ class CandidateGenerator:
         self.smooth_window  = settings.get("smooth_window",    21)
         self.max_deviation  = settings.get("max_deviation",    0.5)
         self.check_interval = settings.get("check_interval",   5.0)
-        self.merge_pct      = settings.get("merge_radius_pct", 15.0)
-        self.time_budget_s  = settings.get("time_budget_s",    60.0)
+        self.merge_pct         = settings.get("merge_radius_pct",  15.0)
+        self.time_budget_s     = settings.get("time_budget_s",     60.0)
+        self.division_length   = settings.get("division_length",   500.0)
+        self.min_tangent_length = settings.get("min_tangent_length", 30.0)
 
     def run_all(self) -> list[CandidateAlignment]:
         results = []
@@ -329,20 +331,33 @@ class CandidateGenerator:
 
     def _run_progressive_mc(self, progress_cb=None, preview_cb=None) -> CandidateAlignment:
         """
-        Progressive element insertion with simulated annealing.
-        Guaranteed to reach max_deviation if feasible.
+        Piecewise MC with boundary constraints + Arc-Line-Arc consolidation.
         """
-        elements = _progressive_mc_build(
+        # ── Phase 1: Piecewise MC ───────────────────────────────────────────
+        elements = _progressive_mc_build_piecewise(
             self.xy, self.chainages,
-            max_deviation=self.max_deviation,
-            min_radius=self.min_radius,
-            merge_pct=self.merge_pct,
-            time_budget_s=self.time_budget_s,
-            progress_cb=progress_cb,
-            preview_cb=preview_cb,
+            max_deviation   = self.max_deviation,
+            min_radius      = self.min_radius,
+            merge_pct       = self.merge_pct,
+            max_elements    = 80,
+            time_budget_s   = self.time_budget_s,
+            division_length = self.division_length,
+            progress_cb     = progress_cb,
+            preview_cb      = preview_cb,
         )
+
+        # ── Phase 2: Arc-Line-Arc consolidation ────────────────────────────
         if progress_cb:
-            progress_cb("Evaluating quality…")
+            progress_cb("Consolidating Arc\u2013Line\u2013Arc patterns\u2026")
+        elements = _consolidate_arc_line_arc(
+            elements, self.xy, self.chainages,
+            min_tangent_length = self.min_tangent_length,
+            min_radius         = self.min_radius,
+        )
+
+        # ── Quality evaluation ─────────────────────────────────────────────
+        if progress_cb:
+            progress_cb("Evaluating quality\u2026")
         metrics = evaluate_candidate(elements, self.xy, self.chainages, self.check_interval)
         return CandidateAlignment("progressive_mc", "Progressive MC", elements, **metrics)
 
@@ -1372,3 +1387,694 @@ def _do_sa_perturbation(
         # Worsening move: accept with SA probability
         if rng.random() >= math.exp(-delta / max(T, 1e-9)):
             boundaries[j] = old_b   # reject
+
+
+# ---------------------------------------------------------------------------
+# Piecewise MC helpers
+# ---------------------------------------------------------------------------
+
+def _place_anchors(chainages: np.ndarray, division_length: float) -> list[int]:
+    """
+    Return OSM node indices used as window boundaries.
+
+    Always includes 0 and N-1.  Between them, selects the node closest
+    to each successive multiple of division_length (< total length).
+    Never adds two consecutive identical indices.
+    """
+    N = len(chainages)
+    if N < 2 or division_length <= 0:
+        return [0, N - 1]
+    ch0    = float(chainages[0])
+    ch_end = float(chainages[-1])
+    if ch_end - ch0 <= division_length:
+        return [0, N - 1]
+
+    anchors = [0]
+    k_mult  = 1
+    while True:
+        target = ch0 + k_mult * division_length
+        if target >= ch_end:
+            break
+        j = int(np.searchsorted(chainages, target))
+        j = max(1, min(N - 2, j))
+        # Pick j-1 if it's closer to the target
+        if j > 0 and abs(float(chainages[j - 1]) - target) < abs(float(chainages[j]) - target):
+            j -= 1
+        if j != anchors[-1]:
+            anchors.append(j)
+        k_mult += 1
+
+    if anchors[-1] != N - 1:
+        anchors.append(N - 1)
+    return anchors
+
+
+def _anchor_tangent(xy: np.ndarray, anchor_idx: int, half_window: int = 5) -> float:
+    """
+    Estimate OSM travel-direction heading at anchor_idx via local SVD fit
+    over the ±half_window neighbouring nodes.
+    """
+    i0 = max(0, anchor_idx - half_window)
+    i1 = min(len(xy) - 1, anchor_idx + half_window)
+    return _fit_line_direction(xy, i0, i1)
+
+
+def _connect_segments_tangent_constrained(
+    segments:      list[_Segment],
+    xy:            np.ndarray,
+    chainages:     np.ndarray,
+    min_radius:    float,
+    entry_heading: float | None = None,
+    exit_heading:  float | None = None,
+) -> list[dict]:
+    """
+    Like _connect_segments_tangent but forces the heading of the first / last
+    primitive to match entry_heading / exit_heading (C1 at window edges).
+
+    For Line primitives: the fitted heading is simply overridden.
+    For Arc primitives:  the Kasa-fitted radius is kept; the center is
+    relocated so that the tangent at the boundary OSM point equals the
+    required heading:
+        CCW: center = P + R*(sin φ, −cos φ)
+        CW:  center = P + R*(−sin φ, +cos φ)
+    """
+    if not segments:
+        return []
+
+    n = len(segments)
+
+    # ── Step 1: fit geometric primitives ─────────────────────────────────
+    fitted: list[dict] = []
+    for seg in segments:
+        if seg.seg_type == "Arc":
+            result = _fit_arc_robust(xy, seg.start_idx, seg.end_idx, min_radius)
+            if result is None:
+                h = _fit_line_direction(xy, seg.start_idx, seg.end_idx)
+                fitted.append({"type": "Line", "heading": h, "seg": seg})
+            else:
+                cx, cy, R = result
+                fitted.append({
+                    "type": "Arc", "cx": cx, "cy": cy, "R": R,
+                    "rot": seg.rot, "seg": seg,
+                })
+        else:
+            h = _fit_line_direction(xy, seg.start_idx, seg.end_idx)
+            fitted.append({"type": "Line", "heading": h, "seg": seg})
+
+    # ── Apply entry_heading constraint ───────────────────────────────────
+    if entry_heading is not None and fitted:
+        f0 = fitted[0]
+        if f0["type"] == "Line":
+            f0["heading"] = entry_heading
+        else:
+            R   = f0["R"]
+            rot = f0["rot"]
+            sp  = math.sin(entry_heading)
+            cp  = math.cos(entry_heading)
+            p   = xy[segments[0].start_idx]
+            if rot == "ccw":
+                f0["cx"] = float(p[0]) + R * sp
+                f0["cy"] = float(p[1]) - R * cp
+            else:
+                f0["cx"] = float(p[0]) - R * sp
+                f0["cy"] = float(p[1]) + R * cp
+
+    # ── Apply exit_heading constraint ────────────────────────────────────
+    if exit_heading is not None and fitted:
+        fm = fitted[-1]
+        if fm["type"] == "Line":
+            fm["heading"] = exit_heading
+        else:
+            R   = fm["R"]
+            rot = fm["rot"]
+            sp  = math.sin(exit_heading)
+            cp  = math.cos(exit_heading)
+            p   = xy[segments[-1].end_idx]
+            if rot == "ccw":
+                fm["cx"] = float(p[0]) + R * sp
+                fm["cy"] = float(p[1]) - R * cp
+            else:
+                fm["cx"] = float(p[0]) - R * sp
+                fm["cy"] = float(p[1]) + R * cp
+
+    # ── Step 2: compute junction points ──────────────────────────────────
+    junctions: list[np.ndarray | None] = [None] * (n + 1)
+    junctions[0] = np.array(xy[segments[0].start_idx], dtype=float)
+    junctions[n] = np.array(xy[segments[-1].end_idx],  dtype=float)
+
+    for j in range(1, n):
+        left  = fitted[j - 1]
+        right = fitted[j]
+
+        if left["type"] == "Line" and right["type"] == "Arc":
+            phi  = left["heading"]
+            prev = junctions[j - 1]
+            for _ in range(5):
+                jx, jy = _arc_line_tangent_junction(
+                    right["cx"], right["cy"], right["R"], right["rot"], phi
+                )
+                if prev is not None:
+                    dx   = jx - float(prev[0])
+                    dy   = jy - float(prev[1])
+                    dist = math.hypot(dx, dy)
+                    if dist > 1e-6:
+                        new_phi = math.atan2(dy, dx)
+                        if abs(new_phi - phi) < 1e-5:
+                            break
+                        phi = new_phi
+                    else:
+                        break
+                else:
+                    break
+            junctions[j] = np.array([jx, jy])
+
+        elif left["type"] == "Arc" and right["type"] == "Line":
+            phi = right["heading"]
+            jx, jy = _arc_line_tangent_junction(
+                left["cx"], left["cy"], left["R"], left["rot"], phi
+            )
+            junctions[j] = np.array([jx, jy])
+
+        else:
+            bdy = fitted[j - 1]["seg"].end_idx
+            junctions[j] = np.array(xy[bdy], dtype=float)
+
+    # ── Step 3: validate junctions ───────────────────────────────────────
+    for j in range(1, n):
+        if junctions[j] is None:
+            bdy = fitted[j - 1]["seg"].end_idx
+            junctions[j] = np.array(xy[bdy], dtype=float)
+            continue
+        seg_l   = fitted[j - 1]["seg"]
+        seg_r   = fitted[j]["seg"]
+        all_pts = xy[seg_l.start_idx: seg_r.end_idx + 1]
+        if len(all_pts) == 0:
+            continue
+        margin = 500.0
+        if not (all_pts[:, 0].min() - margin <= junctions[j][0] <= all_pts[:, 0].max() + margin
+                and all_pts[:, 1].min() - margin <= junctions[j][1] <= all_pts[:, 1].max() + margin):
+            bdy = fitted[j - 1]["seg"].end_idx
+            junctions[j] = np.array(xy[bdy], dtype=float)
+
+    # ── Step 4: build elements from junctions ────────────────────────────
+    elements: list[dict] = []
+    sta = 0.0
+
+    for i, f in enumerate(fitted):
+        start_pt = junctions[i]
+        end_pt   = junctions[i + 1]
+
+        if f["type"] == "Line":
+            seg_len = float(np.linalg.norm(end_pt - start_pt))
+            if seg_len < 1e-6:
+                continue
+            heading = math.atan2(
+                float(end_pt[1] - start_pt[1]),
+                float(end_pt[0] - start_pt[0]),
+            )
+            elements.append({
+                "type":          "Line",
+                "sta_start":     sta,
+                "length":        seg_len,
+                "start":         start_pt.tolist(),
+                "end":           end_pt.tolist(),
+                "direction_rad": heading,
+            })
+            sta += seg_len
+
+        else:  # Arc
+            cx, cy, R = f["cx"], f["cy"], f["R"]
+            rot  = f["rot"]
+            sign = 1.0 if rot == "ccw" else -1.0
+
+            a_s = math.atan2(float(start_pt[1]) - cy, float(start_pt[0]) - cx)
+            a_e = math.atan2(float(end_pt[1])   - cy, float(end_pt[0])   - cx)
+            delta = a_e - a_s
+            if rot == "ccw":
+                while delta <= 0.0:
+                    delta += 2.0 * math.pi
+            else:
+                while delta >= 0.0:
+                    delta -= 2.0 * math.pi
+
+            if abs(delta) > math.pi:
+                chord = float(np.linalg.norm(end_pt - start_pt))
+                if chord > 1e-6:
+                    heading = math.atan2(
+                        float(end_pt[1] - start_pt[1]),
+                        float(end_pt[0] - start_pt[0]),
+                    )
+                    elements.append({
+                        "type": "Line", "sta_start": sta, "length": chord,
+                        "start": start_pt.tolist(), "end": end_pt.tolist(),
+                        "direction_rad": heading,
+                    })
+                    sta += chord
+                continue
+
+            arc_len = R * abs(delta)
+            chord   = float(np.linalg.norm(end_pt - start_pt))
+            elements.append({
+                "type":        "Arc",
+                "sta_start":   sta,
+                "length":      arc_len,
+                "start":       start_pt.tolist(),
+                "end":         end_pt.tolist(),
+                "center":      [cx, cy],
+                "radius":      R,
+                "rot":         rot,
+                "chord":       chord,
+                "_deflection": sign * abs(delta),
+            })
+            sta += arc_len
+
+    return elements
+
+
+def _mc_window_build(
+    xy_win:        np.ndarray,
+    chainages_win: np.ndarray,
+    entry_heading: float,
+    exit_heading:  float,
+    max_deviation: float,
+    min_radius:    float,
+    merge_pct:     float,
+    time_budget_s: float,
+    seed:          int  = 42,
+    max_elements:  int  = 80,
+    progress_cb=None,
+) -> list[dict]:
+    """
+    Run the greedy MC insertion loop on a single window.
+
+    Identical mechanics to _progressive_mc_build but operates on local
+    xy_win / chainages_win so all boundary indices are 0-relative.
+    Final assembly calls _connect_segments_tangent_constrained to enforce
+    C1 at both window edges.  Returns elements whose sta_start values
+    start from 0.0 (the caller adds the chainage offset when stitching).
+    """
+    N_win = len(xy_win)
+    if N_win < 2:
+        return []
+
+    def _p(msg):
+        if progress_cb:
+            progress_cb(msg)
+
+    rng = np.random.default_rng(seed)
+    t_start = time.monotonic()
+
+    boundaries: list[int] = [0, N_win - 1]
+    types:      list[str] = ["Line"]
+    T = max(max_deviation * 2.0, 0.5)
+
+    iteration = 0
+    while True:
+        elapsed = time.monotonic() - t_start
+        if elapsed > time_budget_s:
+            break
+        if len(boundaries) >= max_elements + 1:
+            break
+
+        elements = _build_elements_from_boundaries(
+            boundaries, types, xy_win, chainages_win, min_radius
+        )
+        if not elements:
+            break
+        worst_dev, worst_idx = _worst_osm_deviation(elements, xy_win, chainages_win)
+
+        n_el = len(boundaries) - 1
+        _p(
+            f"Iter {iteration + 1}  |  {n_el} element{'s' if n_el != 1 else ''}"
+            f"  |  dev {worst_dev:.3f} m"
+            f"  |  {elapsed:.0f}/{time_budget_s:.0f} s"
+        )
+
+        if worst_dev <= max_deviation:
+            break
+
+        seg_k = None
+        for k in range(len(boundaries) - 1):
+            if boundaries[k] <= worst_idx <= boundaries[k + 1]:
+                seg_k = k
+                break
+        if seg_k is None:
+            break
+
+        i0, i1 = boundaries[seg_k], boundaries[seg_k + 1]
+
+        if i1 - i0 < 2:
+            if T < 1e-3:
+                break
+            _do_sa_perturbation(boundaries, types, xy_win, chainages_win, min_radius,
+                                worst_dev, rng, T)
+            T *= 0.90
+            iteration += 1
+            continue
+
+        mid = max(i0 + 1, min(i1 - 1, worst_idx))
+
+        best_dev   = worst_dev
+        best_bdry  = boundaries[:]
+        best_types = types[:]
+
+        # Move A: split into two Lines
+        bdry_a = boundaries[:seg_k + 1] + [mid] + boundaries[seg_k + 1:]
+        typ_a  = types[:seg_k] + ["Line", "Line"] + types[seg_k + 1:]
+        dev_a, _ = _worst_osm_deviation(
+            _build_elements_from_boundaries(bdry_a, typ_a, xy_win, chainages_win, min_radius),
+            xy_win, chainages_win,
+        )
+        if dev_a < best_dev:
+            best_dev, best_bdry, best_types = dev_a, bdry_a, typ_a
+
+        # Move B: convert segment to Arc
+        defl_full = _segment_deflection(xy_win[i0: i1 + 1])
+        if (i1 - i0 >= 3
+                and abs(defl_full) >= _MIN_ARC_DEFLECTION_RAD
+                and types[seg_k] != "Arc"):
+            typ_b = types[:seg_k] + ["Arc"] + types[seg_k + 1:]
+            dev_b, _ = _worst_osm_deviation(
+                _build_elements_from_boundaries(boundaries, typ_b, xy_win, chainages_win, min_radius),
+                xy_win, chainages_win,
+            )
+            if dev_b < best_dev:
+                best_dev, best_bdry, best_types = dev_b, boundaries[:], typ_b
+
+        # Move C: Line + Arc
+        if mid - i0 >= 3:
+            defl_r = _segment_deflection(xy_win[mid: i1 + 1])
+            if abs(defl_r) >= _MIN_ARC_DEFLECTION_RAD:
+                bdry_c = boundaries[:seg_k + 1] + [mid] + boundaries[seg_k + 1:]
+                typ_c  = types[:seg_k] + ["Line", "Arc"] + types[seg_k + 1:]
+                dev_c, _ = _worst_osm_deviation(
+                    _build_elements_from_boundaries(bdry_c, typ_c, xy_win, chainages_win, min_radius),
+                    xy_win, chainages_win,
+                )
+                if dev_c < best_dev:
+                    best_dev, best_bdry, best_types = dev_c, bdry_c, typ_c
+
+        # Move D: Arc + Line
+        if i1 - mid >= 3:
+            defl_l = _segment_deflection(xy_win[i0: mid + 1])
+            if abs(defl_l) >= _MIN_ARC_DEFLECTION_RAD:
+                bdry_d = boundaries[:seg_k + 1] + [mid] + boundaries[seg_k + 1:]
+                typ_d  = types[:seg_k] + ["Arc", "Line"] + types[seg_k + 1:]
+                dev_d, _ = _worst_osm_deviation(
+                    _build_elements_from_boundaries(bdry_d, typ_d, xy_win, chainages_win, min_radius),
+                    xy_win, chainages_win,
+                )
+                if dev_d < best_dev:
+                    best_dev, best_bdry, best_types = dev_d, bdry_d, typ_d
+
+        boundaries = best_bdry
+        types      = best_types
+
+        if iteration % 10 == 9 and T > 1e-3:
+            _do_sa_perturbation(boundaries, types, xy_win, chainages_win, min_radius,
+                                best_dev, rng, T)
+            T *= 0.95
+
+        iteration += 1
+
+    # Final assembly with constrained tangent-point junctions
+    segments: list[_Segment] = []
+    for k in range(len(boundaries) - 1):
+        i0, i1 = boundaries[k], boundaries[k + 1]
+        typ  = types[k]
+        defl = _segment_deflection(xy_win[i0: i1 + 1])
+        rot  = "ccw" if defl >= 0 else "cw"
+        R    = math.inf
+        if typ == "Arc":
+            result = _fit_arc_robust(xy_win, i0, i1, min_radius)
+            if result:
+                R = result[2]
+            else:
+                typ = "Line"
+        segments.append(_Segment(
+            seg_type=typ, start_idx=i0, end_idx=i1,
+            R_median=R, rot=rot, deflection=defl,
+        ))
+
+    return _connect_segments_tangent_constrained(
+        segments, xy_win, chainages_win, min_radius,
+        entry_heading=entry_heading,
+        exit_heading=exit_heading,
+    )
+
+
+def _progressive_mc_build_piecewise(
+    xy:              np.ndarray,
+    chainages:       np.ndarray,
+    max_deviation:   float,
+    min_radius:      float,
+    merge_pct:       float = 15.0,
+    max_elements:    int   = 80,
+    time_budget_s:   float = 60.0,
+    division_length: float = 500.0,
+    progress_cb=None,
+    preview_cb=None,
+    preview_interval_s: float = 7.0,
+) -> list[dict]:
+    """
+    Piecewise MC with anchor boundary constraints.
+
+    Divides the OSM polyline into ~division_length windows at the OSM nodes
+    closest to each multiple of division_length.  Runs _mc_window_build
+    independently in each window with the time budget split evenly.
+    C0 + C1 continuity at every inter-window boundary is enforced via
+    _connect_segments_tangent_constrained.
+    """
+    N = len(xy)
+    if N < 2:
+        return []
+
+    def _p(msg):
+        if progress_cb:
+            progress_cb(msg)
+
+    anchors   = _place_anchors(chainages, division_length)
+    n_windows = len(anchors) - 1
+
+    # Compute OSM heading at every anchor node
+    tangents = [_anchor_tangent(xy, anchors[k]) for k in range(len(anchors))]
+
+    budget_per_window = time_budget_s / max(n_windows, 1)
+
+    _p(
+        f"Piecewise MC: {n_windows} window{'s' if n_windows != 1 else ''},"
+        f" {budget_per_window:.0f} s each\u2026"
+    )
+
+    all_elements:    list[dict] = []
+    t_last_preview = time.monotonic()
+
+    for i in range(n_windows):
+        a0, a1 = anchors[i], anchors[i + 1]
+        xy_win        = xy[a0: a1 + 1]
+        chainages_win = chainages[a0: a1 + 1] - chainages[a0]
+
+        sta0_str = f"{float(chainages[a0]):.0f}"
+        sta1_str = f"{float(chainages[a1]):.0f}"
+        _p(f"Window {i + 1}/{n_windows}  ({sta0_str}\u2013{sta1_str} m)\u2026")
+
+        def _win_pcb(msg, _wi=i, _nw=n_windows):
+            _p(f"  [{_wi + 1}/{_nw}] {msg}")
+
+        win_elements = _mc_window_build(
+            xy_win, chainages_win,
+            entry_heading = tangents[i],
+            exit_heading  = tangents[i + 1],
+            max_deviation = max_deviation,
+            min_radius    = min_radius,
+            merge_pct     = merge_pct,
+            time_budget_s = budget_per_window,
+            seed          = 42 + i,
+            max_elements  = max_elements,
+            progress_cb   = _win_pcb,
+        )
+
+        # Shift sta_start by the accumulated chainage offset
+        sta_off = float(chainages[a0])
+        for el in win_elements:
+            el["sta_start"] += sta_off
+
+        all_elements.extend(win_elements)
+
+        # Emit preview after each window (or when interval elapsed)
+        if preview_cb is not None:
+            now = time.monotonic()
+            if now - t_last_preview >= preview_interval_s or i == n_windows - 1:
+                try:
+                    preview_cb(all_elements[:])
+                except Exception:
+                    pass
+                t_last_preview = now
+
+    return all_elements
+
+
+# ---------------------------------------------------------------------------
+# Post-processing: Arc-Line-Arc consolidation
+# ---------------------------------------------------------------------------
+
+def _consolidate_arc_line_arc(
+    elements:           list[dict],
+    xy:                 np.ndarray,
+    chainages:          np.ndarray,
+    min_tangent_length: float,
+    min_radius:         float,
+) -> list[dict]:
+    """
+    Iteratively scan elements for [Arc][short Line][Arc] (same sense only)
+    and merge the triple into a single Arc.
+
+    Skips opposite-sense pairs (S-curves) to preserve their return tangent.
+    Stops when no further merges are possible or min_tangent_length <= 0.
+    """
+    if min_tangent_length <= 0:
+        return elements
+
+    changed = True
+    while changed:
+        changed = False
+        i = 0
+        while i < len(elements) - 2:
+            A = elements[i]
+            L = elements[i + 1]
+            B = elements[i + 2]
+            if (A.get("type") == "Arc"
+                    and L.get("type") == "Line"
+                    and B.get("type") == "Arc"
+                    and L.get("length", 0.0) < min_tangent_length
+                    and A.get("rot") == B.get("rot")):
+                merged = _try_merge_arc_line_arc(elements, i, xy, chainages, min_radius)
+                if merged is not None:
+                    elements = merged
+                    changed  = True
+                    i        = max(0, i - 1)
+                    continue
+            i += 1
+    return elements
+
+
+def _try_merge_arc_line_arc(
+    elements:   list[dict],
+    idx:        int,
+    xy:         np.ndarray,
+    chainages:  np.ndarray,
+    min_radius: float,
+) -> list[dict] | None:
+    """
+    Try to replace elements[idx], elements[idx+1], elements[idx+2] with a
+    single merged Arc.  Returns the updated list on success, None otherwise.
+    """
+    from geometry.alignment import _fit_circle_kasa
+
+    A = elements[idx]
+    B = elements[idx + 2]
+
+    sta_start_A = A.get("sta_start", 0.0)
+    sta_end_B   = B.get("sta_start", 0.0) + B.get("length", 0.0)
+
+    # Collect OSM points under the triple
+    mask    = (chainages >= sta_start_A - 0.1) & (chainages <= sta_end_B + 0.1)
+    all_pts = xy[mask]
+    if len(all_pts) < 3:
+        return None
+
+    # Fit a single circle to the combined point set
+    cx, cy, R_fit = _fit_circle_kasa(all_pts)
+    if cx is None or R_fit is None or not math.isfinite(float(R_fit)):
+        return None
+    R_fit = float(R_fit)
+    cx, cy = float(cx), float(cy)
+    if R_fit < min_radius or R_fit > 1e6:
+        return None
+
+    # Determine rotation from total deflection (must be consistent with Arc_A)
+    defl = _segment_deflection(all_pts)
+    rot  = A.get("rot", "ccw" if defl >= 0 else "cw")
+
+    # Compute left junction (entry into merged arc)
+    if idx > 0 and elements[idx - 1].get("type") == "Line":
+        left_heading = elements[idx - 1].get("direction_rad", 0.0)
+        jx, jy = _arc_line_tangent_junction(cx, cy, R_fit, rot, left_heading)
+    else:
+        sp = A.get("start", [0.0, 0.0])
+        jx, jy = float(sp[0]), float(sp[1])
+
+    # Compute right junction (exit from merged arc)
+    if idx + 3 < len(elements) and elements[idx + 3].get("type") == "Line":
+        right_heading = elements[idx + 3].get("direction_rad", 0.0)
+        jx2, jy2 = _arc_line_tangent_junction(cx, cy, R_fit, rot, right_heading)
+    else:
+        ep = B.get("end", [0.0, 0.0])
+        jx2, jy2 = float(ep[0]), float(ep[1])
+
+    start_pt = np.array([jx,  jy],  dtype=float)
+    end_pt   = np.array([jx2, jy2], dtype=float)
+
+    # Build the merged arc's angular span
+    a_s   = math.atan2(float(start_pt[1]) - cy, float(start_pt[0]) - cx)
+    a_e   = math.atan2(float(end_pt[1])   - cy, float(end_pt[0])   - cx)
+    delta = a_e - a_s
+    if rot == "ccw":
+        while delta <= 0.0:
+            delta += 2.0 * math.pi
+    else:
+        while delta >= 0.0:
+            delta -= 2.0 * math.pi
+
+    if abs(delta) > math.pi:
+        return None   # pathological geometry — skip
+
+    sign    = 1.0 if rot == "ccw" else -1.0
+    arc_len = R_fit * abs(delta)
+    chord   = float(np.linalg.norm(end_pt - start_pt))
+
+    merged_el: dict = {
+        "type":        "Arc",
+        "sta_start":   sta_start_A,
+        "length":      arc_len,
+        "start":       start_pt.tolist(),
+        "end":         end_pt.tolist(),
+        "center":      [cx, cy],
+        "radius":      R_fit,
+        "rot":         rot,
+        "chord":       chord,
+        "_deflection": sign * abs(delta),
+    }
+
+    # Assemble the new element list
+    new_elements: list[dict] = elements[:idx] + [merged_el] + elements[idx + 3:]
+
+    # Update the element immediately before if it is a Line
+    if idx > 0 and new_elements[idx - 1].get("type") == "Line":
+        prev_el = dict(new_elements[idx - 1])
+        sp_prev = np.array(prev_el["start"], dtype=float)
+        prev_el["end"]    = start_pt.tolist()
+        prev_el["length"] = float(np.linalg.norm(start_pt - sp_prev))
+        new_elements[idx - 1] = prev_el
+
+    # Update the element immediately after if it is a Line
+    after_idx = idx + 1   # merged_el sits at idx; the element after is idx+1
+    if after_idx < len(new_elements) and new_elements[after_idx].get("type") == "Line":
+        next_el = dict(new_elements[after_idx])
+        ep_next = np.array(next_el["end"], dtype=float)
+        next_el["start"]  = end_pt.tolist()
+        next_el["length"] = float(np.linalg.norm(ep_next - end_pt))
+        new_elements[after_idx] = next_el
+
+    # Recompute sta_start for every element from idx onward
+    if idx > 0:
+        sta_running = (new_elements[idx - 1].get("sta_start", 0.0)
+                       + new_elements[idx - 1].get("length",   0.0))
+    else:
+        sta_running = 0.0
+    for k in range(idx, len(new_elements)):
+        new_elements[k] = dict(new_elements[k])
+        new_elements[k]["sta_start"] = sta_running
+        sta_running += new_elements[k].get("length", 0.0)
+
+    return new_elements
