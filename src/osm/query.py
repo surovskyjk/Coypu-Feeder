@@ -112,26 +112,36 @@ def _run_query(
             response = requests.post(
                 url, data={"data": query}, timeout=TIMEOUT
             )
-            if response.status_code == 429:
+            code = response.status_code
+            if code == 429:
+                # Rate-limited — short sleep then move to next mirror
                 if progress_cb:
-                    progress_cb(f"Server {i + 1}/{n} rate-limited, waiting…")
-                time.sleep(5)
-                response = requests.post(
-                    url, data={"data": query}, timeout=TIMEOUT
+                    progress_cb(f"Server {i + 1}/{n} rate-limited, skipping…")
+                time.sleep(2)
+                last_exc = requests.exceptions.HTTPError(
+                    f"429 Rate Limited", response=response
                 )
-            response.raise_for_status()
+                continue
+            if not response.ok:
+                # Any non-2xx from this mirror (400, 406, 500, 503, 504 …)
+                # is treated as a mirror-specific failure.  Try the next one.
+                if progress_cb:
+                    progress_cb(
+                        f"Server {i + 1}/{n} returned HTTP {code}, trying next…"
+                    )
+                last_exc = requests.exceptions.HTTPError(
+                    f"HTTP {code}", response=response
+                )
+                if code in (503, 504):
+                    time.sleep(2)
+                continue
             data = response.json()
             _cache_put(key, data)
             return data
-        except requests.exceptions.HTTPError as exc:
-            last_exc = exc
-            code = exc.response.status_code if exc.response is not None else 0
-            if code in (429, 504):
-                time.sleep(3)
-                continue
-            raise
         except requests.exceptions.RequestException as exc:
             last_exc = exc
+            if progress_cb:
+                progress_cb(f"Server {i + 1}/{n} unreachable, trying next…")
             continue
 
     if last_exc is None:
