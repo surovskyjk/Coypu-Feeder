@@ -172,8 +172,18 @@ class CandidateGenerator:
         self.check_interval = settings.get("check_interval",   5.0)
         self.merge_pct         = settings.get("merge_radius_pct",  15.0)
         self.time_budget_s     = settings.get("time_budget_s",     60.0)
-        self.division_length   = settings.get("division_length",   500.0)
-        self.min_tangent_length = settings.get("min_tangent_length", 30.0)
+        self.division_length    = settings.get("division_length",    500.0)
+        self.min_tangent_length = settings.get("min_tangent_length",  30.0)
+        self.min_kappa_radius   = settings.get("min_kappa_radius",     0.0)
+        self.min_kappa_length   = settings.get("min_kappa_length",   200.0)
+
+        # Precompute forced-line chainage ranges once (shared by all algorithms)
+        self._forced_ch_ranges: list[tuple[float, float]] = _compute_forced_line_ranges(
+            self.xy, self.chainages,
+            smooth_window    = self.smooth_window,
+            min_kappa_radius = self.min_kappa_radius,
+            min_kappa_length = self.min_kappa_length,
+        )
 
     def run_all(self) -> list[CandidateAlignment]:
         results = []
@@ -291,6 +301,10 @@ class CandidateGenerator:
 
         _p("Assembling elements with tangent junctions…")
         elements = _connect_segments_tangent(segments, xy, chainages, self.min_radius)
+        _p("Post-processing (C1 enforcement)…")
+        elements = _post_process_elements(
+            elements, self._forced_ch_ranges, self.min_radius
+        )
         _p("Evaluating quality…")
         metrics  = evaluate_candidate(elements, xy, chainages, self.check_interval)
         return CandidateAlignment("segment_fit", "Segment & Fit", elements, **metrics)
@@ -320,6 +334,10 @@ class CandidateGenerator:
         _p("Assembling elements with tangent junctions…")
         elements = _connect_segments_tangent(
             segments, self.xy, self.chainages, self.min_radius
+        )
+        _p("Post-processing (C1 enforcement)…")
+        elements = _post_process_elements(
+            elements, self._forced_ch_ranges, self.min_radius
         )
         _p("Evaluating quality…")
         metrics = evaluate_candidate(elements, self.xy, self.chainages, self.check_interval)
@@ -353,6 +371,13 @@ class CandidateGenerator:
             elements, self.xy, self.chainages,
             min_tangent_length = self.min_tangent_length,
             min_radius         = self.min_radius,
+        )
+
+        # ── Phase 3: C1 post-processing ────────────────────────────────────
+        if progress_cb:
+            progress_cb("Post-processing (C1 enforcement)\u2026")
+        elements = _post_process_elements(
+            elements, self._forced_ch_ranges, self.min_radius
         )
 
         # ── Quality evaluation ─────────────────────────────────────────────
@@ -2078,3 +2103,401 @@ def _try_merge_arc_line_arc(
         sta_running += new_elements[k].get("length", 0.0)
 
     return new_elements
+
+
+# ---------------------------------------------------------------------------
+# C1 continuity post-processing
+# ---------------------------------------------------------------------------
+
+def _arc_tangent_heading(cx: float, cy: float, px: float, py: float, rot: str) -> float:
+    """
+    Tangent heading (rad) at point (px, py) on an arc with center (cx, cy).
+
+    CCW arc:  tangent direction = (-sin θ, cos θ)  where θ = atan2(py-cy, px-cx)
+              ⟹  atan2(dx, -dy)
+    CW  arc:  tangent direction = ( sin θ, -cos θ)
+              ⟹  atan2(-dx, dy)
+    """
+    dx = px - cx
+    dy = py - cy
+    if rot == "ccw":
+        return math.atan2(dx, -dy)
+    else:
+        return math.atan2(-dx, dy)
+
+
+def _compute_forced_line_ranges(
+    xy:               np.ndarray,
+    chainages:        np.ndarray,
+    smooth_window:    int,
+    min_kappa_radius: float,
+    min_kappa_length: float,
+) -> list[tuple[float, float]]:
+    """
+    Return list of (sta_start, sta_end) chainage pairs where smoothed |κ|
+    is below 1/min_kappa_radius for at least min_kappa_length metres.
+
+    Returns [] if min_kappa_radius <= 0 or min_kappa_length <= 0.
+    """
+    from geometry.curvature import compute_curvature, smooth_curvature
+
+    if min_kappa_radius <= 0 or min_kappa_length <= 0:
+        return []
+    N = len(xy)
+    if N < 3:
+        return []
+
+    threshold = 1.0 / min_kappa_radius
+    kappa        = compute_curvature(xy)
+    kappa_smooth = smooth_curvature(kappa, window=smooth_window)
+
+    forced: list[tuple[float, float]] = []
+    in_run    = False
+    run_start = 0
+
+    for i in range(N):
+        if abs(float(kappa_smooth[i])) < threshold:
+            if not in_run:
+                in_run    = True
+                run_start = i
+        else:
+            if in_run:
+                in_run = False
+                span = float(chainages[i - 1]) - float(chainages[run_start])
+                if span >= min_kappa_length:
+                    forced.append((
+                        float(chainages[run_start]),
+                        float(chainages[i - 1]),
+                    ))
+
+    if in_run:
+        span = float(chainages[N - 1]) - float(chainages[run_start])
+        if span >= min_kappa_length:
+            forced.append((
+                float(chainages[run_start]),
+                float(chainages[N - 1]),
+            ))
+
+    return forced
+
+
+def _merge_adjacent_line_elements(elements: list[dict]) -> list[dict]:
+    """
+    Merge any two or more consecutive Line elements into a single Line.
+    Recomputes length, heading, and sta_start chain after merging.
+    """
+    if not elements:
+        return elements
+
+    merged: list[dict] = []
+    for el in elements:
+        if (merged
+                and el.get("type") == "Line"
+                and merged[-1].get("type") == "Line"):
+            prev    = merged[-1]
+            new_end = el["end"]
+            sp      = np.array(prev["start"], dtype=float)
+            ep      = np.array(new_end,       dtype=float)
+            prev["end"]           = new_end
+            prev["length"]        = float(np.linalg.norm(ep - sp))
+            prev["direction_rad"] = math.atan2(
+                float(ep[1] - sp[1]), float(ep[0] - sp[0])
+            )
+        else:
+            merged.append(dict(el))
+
+    # Recompute sta_start chain
+    sta = 0.0
+    for el in merged:
+        el["sta_start"] = sta
+        sta += el.get("length", 0.0)
+
+    return merged
+
+
+def _insert_line_line_connector_arc(
+    elements:   list[dict],
+    idx:        int,
+    min_radius: float,
+) -> list[dict] | None:
+    """
+    Insert a small circular arc of radius min_radius between the two consecutive
+    Line elements at elements[idx] and elements[idx+1] to achieve C1 continuity.
+
+    Returns the modified element list, or None if the arc cannot be fitted
+    (collinear lines, or the tangent runout does not fit inside both elements).
+    """
+    A     = elements[idx]
+    B     = elements[idx + 1]
+    phi_A = A.get("direction_rad", 0.0)
+    phi_B = B.get("direction_rad", 0.0)
+
+    d_phi = phi_B - phi_A
+    while d_phi >  math.pi: d_phi -= 2.0 * math.pi
+    while d_phi < -math.pi: d_phi += 2.0 * math.pi
+
+    if abs(d_phi) < 1e-4:
+        return None   # effectively collinear — no arc needed
+
+    T = min_radius * math.tan(abs(d_phi) / 2.0)
+    len_A = A.get("length", 0.0)
+    len_B = B.get("length", 0.0)
+    if T <= 0 or T >= len_A * 0.45 or T >= len_B * 0.45:
+        return None   # arc does not fit within the adjacent elements
+
+    kink    = np.array(A["end"], dtype=float)
+    cos_a   = math.cos(phi_A)
+    sin_a   = math.sin(phi_A)
+    cos_b   = math.cos(phi_B)
+    sin_b   = math.sin(phi_B)
+
+    tp_a = kink - T * np.array([cos_a, sin_a])   # tangent point on Line A
+    tp_b = kink + T * np.array([cos_b, sin_b])   # tangent point on Line B
+
+    rot = "ccw" if d_phi > 0 else "cw"
+    R   = min_radius
+    if rot == "ccw":
+        center = tp_a + R * np.array([-sin_a,  cos_a])
+    else:
+        center = tp_a + R * np.array([ sin_a, -cos_a])
+
+    arc_len = R * abs(d_phi)
+    chord   = float(np.linalg.norm(tp_b - tp_a))
+    sign    = 1.0 if rot == "ccw" else -1.0
+
+    new_A = dict(A)
+    new_A["end"]    = tp_a.tolist()
+    new_A["length"] = float(np.linalg.norm(tp_a - np.array(A["start"], dtype=float)))
+
+    b_end   = np.array(B["end"], dtype=float)
+    new_B   = dict(B)
+    new_B["start"]        = tp_b.tolist()
+    new_B["length"]       = float(np.linalg.norm(b_end - tp_b))
+    new_B["direction_rad"] = math.atan2(
+        float(b_end[1] - tp_b[1]), float(b_end[0] - tp_b[0])
+    )
+
+    arc_el: dict = {
+        "type":        "Arc",
+        "sta_start":   new_A["sta_start"] + new_A["length"],
+        "length":      arc_len,
+        "start":       tp_a.tolist(),
+        "end":         tp_b.tolist(),
+        "center":      center.tolist(),
+        "radius":      R,
+        "rot":         rot,
+        "chord":       chord,
+        "_deflection": sign * abs(d_phi),
+    }
+
+    new_elements = elements[:idx] + [new_A, arc_el, new_B] + elements[idx + 2:]
+
+    # Recompute sta_start chain from idx onward
+    sta = new_A["sta_start"]
+    for k in range(idx, len(new_elements)):
+        new_elements[k] = dict(new_elements[k])
+        new_elements[k]["sta_start"] = sta
+        sta += new_elements[k].get("length", 0.0)
+
+    return new_elements
+
+
+def _enforce_c1_junctions(
+    elements:           list[dict],
+    min_radius:         float,
+    max_junction_shift: float = 25.0,
+    min_kink_rad:       float = 0.004,
+) -> list[dict]:
+    """
+    Multi-pass junction correction to enforce C1 continuity.
+
+    Junction types handled:
+      Line→Arc  : move junction to tangent point on arc (tangent = line heading)
+      Arc→Line  : same, symmetric
+      Arc→Arc   : compute Arc_A tangent at junction; find tangent point on Arc_B
+                  with that heading; update if shift < max_junction_shift
+
+    Line→Line kinks are handled by _insert_line_line_connector_arc (called earlier
+    in _post_process_elements).
+
+    Runs up to 4 passes; stops early if no junction changed by more than 1e-4 m.
+    Recomputes sta_start chain after all passes.
+    """
+    MAX_PASSES = 4
+
+    def _recompute_arc_length(el: dict) -> float:
+        cx   = el["center"][0];  cy  = el["center"][1]
+        R    = el["radius"];     rot = el["rot"]
+        sp   = el["start"];      ep  = el["end"]
+        a_s  = math.atan2(sp[1] - cy, sp[0] - cx)
+        a_e  = math.atan2(ep[1] - cy, ep[0] - cx)
+        delta = a_e - a_s
+        if rot == "ccw":
+            while delta <= 0.0: delta += 2.0 * math.pi
+        else:
+            while delta >= 0.0: delta -= 2.0 * math.pi
+        if abs(delta) > math.pi:
+            return el.get("length", 0.0)   # pathological — keep old length
+        return R * abs(delta)
+
+    for _pass in range(MAX_PASSES):
+        any_change = False
+        elements   = [dict(e) for e in elements]
+
+        for i in range(len(elements) - 1):
+            L    = elements[i]
+            R_el = elements[i + 1]
+            lt   = L.get("type",   "Line")
+            rt   = R_el.get("type","Line")
+
+            if lt == "Line" and rt == "Arc":
+                phi  = L.get("direction_rad", 0.0)
+                cx   = R_el["center"][0];  cy = R_el["center"][1]
+                R_v  = R_el["radius"];     rot = R_el["rot"]
+                jx, jy = _arc_line_tangent_junction(cx, cy, R_v, rot, phi)
+                cur    = np.array(L["end"], dtype=float)
+                shift  = math.hypot(jx - cur[0], jy - cur[1])
+                if 1e-4 < shift <= max_junction_shift:
+                    new_j = [jx, jy]
+                    elements[i]["end"]           = new_j
+                    elements[i]["length"]         = float(np.linalg.norm(
+                        np.array(new_j) - np.array(L["start"], dtype=float)
+                    ))
+                    elements[i]["direction_rad"]  = math.atan2(
+                        new_j[1] - L["start"][1], new_j[0] - L["start"][0]
+                    )
+                    elements[i + 1]["start"]      = new_j
+                    elements[i + 1]["length"]     = _recompute_arc_length(elements[i + 1])
+                    any_change = True
+
+            elif lt == "Arc" and rt == "Line":
+                phi  = R_el.get("direction_rad", 0.0)
+                cx   = L["center"][0];  cy = L["center"][1]
+                R_v  = L["radius"];     rot = L["rot"]
+                jx, jy = _arc_line_tangent_junction(cx, cy, R_v, rot, phi)
+                cur    = np.array(L["end"], dtype=float)
+                shift  = math.hypot(jx - cur[0], jy - cur[1])
+                if 1e-4 < shift <= max_junction_shift:
+                    new_j = [jx, jy]
+                    elements[i]["end"]            = new_j
+                    elements[i]["length"]          = _recompute_arc_length(elements[i])
+                    elements[i + 1]["start"]       = new_j
+                    elements[i + 1]["length"]      = float(np.linalg.norm(
+                        np.array(R_el["end"], dtype=float) - np.array(new_j)
+                    ))
+                    elements[i + 1]["direction_rad"] = math.atan2(
+                        R_el["end"][1] - new_j[1], R_el["end"][0] - new_j[0]
+                    )
+                    any_change = True
+
+            elif lt == "Arc" and rt == "Arc":
+                cur_j   = np.array(L["end"], dtype=float)
+                cx_a    = L["center"][0];   cy_a = L["center"][1]
+                heading_a = _arc_tangent_heading(cx_a, cy_a,
+                                                  float(cur_j[0]), float(cur_j[1]),
+                                                  L["rot"])
+                cx_b   = R_el["center"][0]; cy_b = R_el["center"][1]
+                R_b    = R_el["radius"];    rot_b = R_el["rot"]
+                jx, jy = _arc_line_tangent_junction(cx_b, cy_b, R_b, rot_b, heading_a)
+                shift  = math.hypot(jx - float(cur_j[0]), jy - float(cur_j[1]))
+                if 1e-4 < shift <= max_junction_shift:
+                    new_j = [jx, jy]
+                    elements[i]["end"]        = new_j
+                    elements[i]["length"]      = _recompute_arc_length(elements[i])
+                    elements[i + 1]["start"]   = new_j
+                    elements[i + 1]["length"]  = _recompute_arc_length(elements[i + 1])
+                    any_change = True
+
+        if not any_change:
+            break
+
+    # Recompute sta_start chain
+    if elements:
+        sta = elements[0].get("sta_start", 0.0)
+        for el in elements:
+            el["sta_start"] = sta
+            sta += el.get("length", 0.0)
+
+    return elements
+
+
+def _post_process_elements(
+    elements:         list[dict],
+    forced_ch_ranges: list[tuple[float, float]],
+    min_radius:       float,
+    min_kink_rad:     float = 0.004,
+) -> list[dict]:
+    """
+    Apply all C1 post-processing steps uniformly to any algorithm's output:
+
+    1. Demote Arc elements that overlap a forced-line chainage range → Line
+    2. Merge adjacent Line elements
+    3. Insert connector arcs at Line→Line kinks (heading diff > min_kink_rad)
+    4. Enforce C1 at Line→Arc, Arc→Line, Arc→Arc junctions
+    5. Final merge of adjacent Lines (forced-line demotion may create new adjacencies)
+
+    Returns a new element list.  Input is not modified.
+    """
+    if not elements:
+        return elements
+
+    # ── Step 1: demote Arcs that overlap forced-line chainage ranges ──────
+    if forced_ch_ranges:
+        out: list[dict] = []
+        for el in elements:
+            if el.get("type") == "Arc":
+                sta0 = el.get("sta_start", 0.0)
+                sta1 = sta0 + el.get("length", 0.0)
+                overlap = any(
+                    sta0 < r_end and sta1 > r_start
+                    for r_start, r_end in forced_ch_ranges
+                )
+                if overlap:
+                    sp = np.array(el["start"], dtype=float)
+                    ep = np.array(el["end"],   dtype=float)
+                    out.append({
+                        "type":          "Line",
+                        "sta_start":     sta0,
+                        "length":        float(np.linalg.norm(ep - sp)),
+                        "start":         el["start"],
+                        "end":           el["end"],
+                        "direction_rad": math.atan2(
+                            float(ep[1] - sp[1]), float(ep[0] - sp[0])
+                        ),
+                    })
+                    continue
+            out.append(dict(el))
+        elements = out
+
+    # ── Step 2: merge adjacent Lines ──────────────────────────────────────
+    elements = _merge_adjacent_line_elements(elements)
+
+    # ── Step 3: insert connector arcs at Line→Line kinks ─────────────────
+    changed = True
+    while changed:
+        changed = False
+        i = 0
+        while i < len(elements) - 1:
+            if (elements[i].get("type") == "Line"
+                    and elements[i + 1].get("type") == "Line"):
+                phi_a = elements[i].get("direction_rad", 0.0)
+                phi_b = elements[i + 1].get("direction_rad", 0.0)
+                d_phi = phi_b - phi_a
+                while d_phi >  math.pi: d_phi -= 2.0 * math.pi
+                while d_phi < -math.pi: d_phi += 2.0 * math.pi
+                if abs(d_phi) >= min_kink_rad:
+                    new_els = _insert_line_line_connector_arc(elements, i, min_radius)
+                    if new_els is not None:
+                        elements = new_els
+                        changed  = True
+                        i        = max(0, i - 1)
+                        continue
+            i += 1
+
+    # ── Step 4: enforce C1 at remaining junctions ────────────────────────
+    elements = _enforce_c1_junctions(elements, min_radius, min_kink_rad=min_kink_rad)
+
+    # ── Step 5: final Line merge (cleanup) ────────────────────────────────
+    elements = _merge_adjacent_line_elements(elements)
+
+    return elements

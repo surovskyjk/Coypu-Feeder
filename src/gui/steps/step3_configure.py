@@ -113,6 +113,33 @@ class Step3Configure(QWidget):
         )
         af.addRow("Minimum curve radius:", self._min_radius_spin)
 
+        self._min_kappa_radius_spin = QDoubleSpinBox()
+        self._min_kappa_radius_spin.setRange(0.0, 50000.0)
+        self._min_kappa_radius_spin.setSingleStep(500.0)
+        self._min_kappa_radius_spin.setDecimals(0)
+        self._min_kappa_radius_spin.setValue(0.0)
+        self._min_kappa_radius_spin.setSuffix(" m")
+        self._min_kappa_radius_spin.setSpecialValueText("Disabled")
+        self._min_kappa_radius_spin.setToolTip(
+            "Sections where the smoothed OSM curvature radius exceeds this value\n"
+            "for at least 'Min straight length' metres are forced to Line elements\n"
+            "regardless of what the fitting algorithm decides.\n"
+            "0 = disabled.  Typical: 5 000–20 000 m."
+        )
+        af.addRow("Min straight radius:", self._min_kappa_radius_spin)
+
+        self._min_kappa_length_spin = QDoubleSpinBox()
+        self._min_kappa_length_spin.setRange(10.0, 5000.0)
+        self._min_kappa_length_spin.setSingleStep(50.0)
+        self._min_kappa_length_spin.setDecimals(0)
+        self._min_kappa_length_spin.setValue(200.0)
+        self._min_kappa_length_spin.setSuffix(" m")
+        self._min_kappa_length_spin.setToolTip(
+            "Minimum length of a low-curvature section to be forced to a Line.\n"
+            "Only used when 'Min straight radius' > 0."
+        )
+        af.addRow("Min straight length:", self._min_kappa_length_spin)
+
         v.addWidget(acc_group)
 
         # ── Candidate Generation ──────────────────────────────────────
@@ -239,8 +266,10 @@ class Step3Configure(QWidget):
             "min_radius":      self._min_radius_spin.value(),
             "merge_radius_pct": self._merge_pct_spin.value(),
             "time_budget_s":    float(self._time_budget_spin.value()),
-            "division_length":   self._division_spin.value(),
+            "division_length":    self._division_spin.value(),
             "min_tangent_length": self._min_tangent_spin.value(),
+            "min_kappa_radius":   self._min_kappa_radius_spin.value(),
+            "min_kappa_length":   self._min_kappa_length_spin.value(),
             # Keep these with defaults so downstream code that still references
             # them (e.g. old ExportWorker path) does not KeyError.
             "check_interval":  5.0,
