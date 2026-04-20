@@ -186,10 +186,11 @@ class Step4Candidates(QWidget):
     back_requested       = Signal()         # user clicked ← Back to Configure
 
     ALGO_DEFS = [
-        ("segment_fit",    "Segment & Fit",    "#ff9800"),
-        ("dp_segment",     "DP Segmentation",  "#66bb6a"),
-        ("progressive_mc", "Progressive MC",   "#42a5f5"),
-        ("raw",            "OSM Polyline",     "#e040fb"),
+        ("segment_fit",         "Segment & Fit",           "#ff9800"),
+        ("segment_fit_spirals", "Segment & Fit (Spirals)", "#26c6da"),
+        ("dp_segment",          "DP Segmentation",         "#66bb6a"),
+        ("progressive_mc",      "Progressive MC",          "#42a5f5"),
+        ("raw",                 "OSM Polyline",            "#e040fb"),
     ]
 
     def __init__(self, parent=None):

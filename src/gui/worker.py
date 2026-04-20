@@ -112,10 +112,11 @@ class CandidateWorker(QThread):
     failed            = Signal(str)
 
     _ALGO_COLORS = {
-        "segment_fit":    "#ff9800",
-        "dp_segment":     "#66bb6a",
-        "progressive_mc": "#42a5f5",
-        "raw":            "#e040fb",
+        "segment_fit":         "#ff9800",
+        "segment_fit_spirals": "#26c6da",
+        "dp_segment":          "#66bb6a",
+        "progressive_mc":      "#42a5f5",
+        "raw":                 "#e040fb",
     }
 
     def __init__(self, xy_list, chainages_list, settings: dict, parent=None):
@@ -137,7 +138,7 @@ class CandidateWorker(QThread):
 
             gen = CandidateGenerator(xy, chs, self._settings)
 
-            for algo_id in ["segment_fit", "dp_segment", "progressive_mc", "raw"]:
+            for algo_id in ["segment_fit", "segment_fit_spirals", "dp_segment", "progressive_mc", "raw"]:
                 color = self._ALGO_COLORS.get(algo_id, "#ffffff")
 
                 # --- progress text callback (called from algorithm internals) ---
