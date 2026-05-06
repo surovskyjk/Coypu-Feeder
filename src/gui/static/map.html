@@ -4,6 +4,17 @@
 <meta charset="utf-8"/>
 <style>
   html, body, #map { width:100%; height:100%; margin:0; padding:0; background:#1a1a1a; }
+  .aln-tip {
+    background: rgba(30,30,30,0.92);
+    color: #f0f0f0;
+    border: 1px solid #555;
+    border-radius: 4px;
+    font-family: "Segoe UI", "Helvetica Neue", sans-serif;
+    font-size: 11px;
+    padding: 6px 8px;
+    line-height: 1.4;
+  }
+  .aln-tip b { color: #ffd54f; }
 </style>
 <link rel="stylesheet" href="leaflet.css"/>
 <script src="leaflet.js"></script>
@@ -21,6 +32,7 @@ map.createPane('osmRefPane').style.zIndex      = '630';
 map.createPane('candidatesPane').style.zIndex  = '620';
 map.createPane('alignmentGlowPane').style.zIndex = '640';
 map.createPane('alignmentPane').style.zIndex   = '650';
+map.createPane('crossSectionPane').style.zIndex = '625';
 
 var baseLayer       = null;
 var railOverlay     = null;
@@ -28,6 +40,8 @@ var trackLayers     = [];
 var osmRefLayers    = [];
 var alignmentLayers = [];
 var candidateLayers = [];
+var csLeftLayer     = null;
+var csRightLayer    = null;
 var backend         = null;
 var _showRailOverlay = true;
 
@@ -138,9 +152,78 @@ function showAlignment(alns) {
     var latlngs = aln.nodes.map(function(n){ return [n[0],n[1]]; });
     if (latlngs.length < 2) return;
     all = all.concat(latlngs);
-    L.polyline(latlngs, {color:'#ffffff', weight:14, opacity:0.2, pane:'alignmentGlowPane'}).addTo(map);
+    var glow = L.polyline(latlngs, {color:'#ffffff', weight:14, opacity:0.2, pane:'alignmentGlowPane'}).addTo(map);
     var bright = L.polyline(latlngs, {color:'#ff1744', weight:5, opacity:1.0, pane:'alignmentPane'}).addTo(map);
+    alignmentLayers.push(glow);
     alignmentLayers.push(bright);
+  });
+  if (all.length)
+    try { map.flyToBounds(L.latLngBounds(all), {padding:[30,30], duration:0.8}); } catch(e){}
+}
+
+/* ── Per-element coloured alignment (Step 5+ and after export) ── */
+/*
+ * segments  : [{type:"Line"|"Arc"|"Spiral", points:[[lat,lon],...], params:{...}}, ...]
+ *
+ * Each element drawn as a separate coloured polyline with a sticky HTML
+ * tooltip that lists its parameters. A single white glow halo is drawn
+ * underneath the merged path for visibility.
+ */
+var ELEMENT_COLOR = {
+  "Line":   "#42a5f5",
+  "Arc":    "#ef5350",
+  "Spiral": "#66bb6a"
+};
+
+function _fmtTooltip(seg) {
+  var p = seg.params || {};
+  var deg = function(rad) { return (rad * 180.0 / Math.PI).toFixed(2); };
+  var num = function(v, n) { if (v === undefined || v === null) return "—"; return Number(v).toFixed(n === undefined ? 2 : n); };
+  if (seg.type === "Line") {
+    return "<b>Line</b><br>" +
+           "Length: "      + num(p.length)         + " m<br>" +
+           "Station: "     + num(p.sta_start)      + " → " + num((p.sta_start||0) + (p.length||0)) + " m<br>" +
+           "Direction: "   + (p.direction_rad !== undefined ? deg(p.direction_rad) + "°" : "—");
+  } else if (seg.type === "Arc") {
+    var defl = (p._deflection !== undefined) ? deg(p._deflection) : (p.deflection_deg !== undefined ? num(p.deflection_deg) : "—");
+    return "<b>Arc</b><br>" +
+           "Length: "      + num(p.length)         + " m<br>" +
+           "Radius: "      + num(p.radius)         + " m<br>" +
+           "Deflection: "  + defl                  + "°<br>" +
+           "Rotation: "    + (p.rot || "—")        + "<br>" +
+           "Station: "     + num(p.sta_start)      + " → " + num((p.sta_start||0) + (p.length||0)) + " m";
+  } else if (seg.type === "Spiral") {
+    var rs = (p.radius_start === null || p.radius_start === undefined || !isFinite(p.radius_start)) ? "∞" : num(p.radius_start) + " m";
+    var re = (p.radius_end   === null || p.radius_end   === undefined || !isFinite(p.radius_end))   ? "∞" : num(p.radius_end)   + " m";
+    return "<b>Spiral (clothoid)</b><br>" +
+           "Length: "      + num(p.length)         + " m<br>" +
+           "Parameter A: " + num(p.clothoid_A)     + " m<br>" +
+           "Radius: "      + rs + " → " + re        + "<br>" +
+           "Rotation: "    + (p.rot || "—")        + "<br>" +
+           "Station: "     + num(p.sta_start)      + " → " + num((p.sta_start||0) + (p.length||0)) + " m";
+  }
+  return "<b>" + seg.type + "</b>";
+}
+
+function showAlignmentSegmented(segments) {
+  clearAlignment();
+  var all = [];
+  segments.forEach(function(seg) {
+    var pts = (seg.points || []).map(function(n){ return [n[0], n[1]]; });
+    if (pts.length < 2) return;
+    all = all.concat(pts);
+    /* White glow halo */
+    var glow = L.polyline(pts, {
+      color: '#ffffff', weight: 11, opacity: 0.20, pane: 'alignmentGlowPane'
+    }).addTo(map);
+    alignmentLayers.push(glow);
+    /* Coloured main element */
+    var col = ELEMENT_COLOR[seg.type] || '#ffffff';
+    var pl = L.polyline(pts, {
+      color: col, weight: 4, opacity: 0.95, pane: 'alignmentPane'
+    }).addTo(map);
+    pl.bindTooltip(_fmtTooltip(seg), {sticky: true, direction: 'top', className: 'aln-tip'});
+    alignmentLayers.push(pl);
   });
   if (all.length)
     try { map.flyToBounds(L.latLngBounds(all), {padding:[30,30], duration:0.8}); } catch(e){}
@@ -165,8 +248,9 @@ function showCandidates(candidates) {
     var latlngs = c.nodes.map(function(n){ return [n[0], n[1]]; });
     if (latlngs.length < 2) return;
     /* Glow */
-    L.polyline(latlngs, {color:'#ffffff', weight:10, opacity:0.15,
+    var glow = L.polyline(latlngs, {color:'#ffffff', weight:10, opacity:0.15,
                           pane:'candidatesPane'}).addTo(map);
+    candidateLayers.push(glow);
     /* Main line */
     var pl = L.polyline(latlngs, {
       color:   c.color || '#ffffff',
@@ -186,11 +270,34 @@ function clearCandidates() {
   candidateLayers = [];
 }
 
+/* ── Cross-section overlays (left / right, colour-coded) ──────── */
+function showCrossSection(leftPts, rightPts) {
+  clearCrossSection();
+  function buildLayer(pts) {
+    var layer = L.layerGroup();
+    for (var i = 0; i < pts.length - 1; i++) {
+      L.polyline(
+        [[pts[i][0], pts[i][1]], [pts[i+1][0], pts[i+1][1]]],
+        {color: pts[i][2], weight: 4, opacity: 0.85, pane: 'crossSectionPane'}
+      ).addTo(layer);
+    }
+    return layer;
+  }
+  if (leftPts  && leftPts.length  > 0) csLeftLayer  = buildLayer(leftPts).addTo(map);
+  if (rightPts && rightPts.length > 0) csRightLayer = buildLayer(rightPts).addTo(map);
+}
+
+function clearCrossSection() {
+  if (csLeftLayer)  { try { map.removeLayer(csLeftLayer);  } catch(e) {} csLeftLayer  = null; }
+  if (csRightLayer) { try { map.removeLayer(csRightLayer); } catch(e) {} csRightLayer = null; }
+}
+
 function clearAll() {
   showTracks([]);
   clearOSMReference();
   clearAlignment();
   clearCandidates();
+  clearCrossSection();
 }
 </script>
 </body>

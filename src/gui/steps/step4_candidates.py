@@ -97,6 +97,19 @@ class CandidateCard(QGroupBox):
         n_row.addStretch()
         gform.addLayout(n_row)
 
+        jump_row = QHBoxLayout()
+        jump_lbl = QLabel("C1 mismatch:")
+        jump_lbl.setToolTip(
+            "Maximum tangent-direction mismatch between successive elements\n"
+            "(0° = perfect C1 continuity)."
+        )
+        jump_row.addWidget(jump_lbl)
+        self._jump_lbl = QLabel("—")
+        self._jump_lbl.setStyleSheet("color: #aaa;")
+        jump_row.addWidget(self._jump_lbl)
+        jump_row.addStretch()
+        gform.addLayout(jump_row)
+
         layout.addLayout(gform)
 
         # ── Select button ─────────────────────────────────────────────
@@ -121,6 +134,8 @@ class CandidateCard(QGroupBox):
         self._dev_lbl.setStyleSheet("color: #aaa;")
         self._rmse_lbl.setText("—")
         self._n_lbl.setText("—")
+        self._jump_lbl.setText("—")
+        self._jump_lbl.setStyleSheet("color: #aaa;")
         self._btn.setEnabled(False)
         self._progress_bar.setVisible(False)
         self._status_lbl.setVisible(False)
@@ -161,6 +176,15 @@ class CandidateCard(QGroupBox):
         self._rmse_lbl.setStyleSheet("color: #aaa;")
         self._n_lbl.setText(str(candidate.n_elements))
         self._n_lbl.setStyleSheet("color: #aaa;")
+        # Heading-jump (C1 sanity): green if < 0.1°, amber if < 1°, red otherwise
+        jump = float(getattr(candidate, "max_heading_jump_deg", 0.0) or 0.0)
+        self._jump_lbl.setText(f"{jump:.3f}°")
+        if jump < 0.1:
+            self._jump_lbl.setStyleSheet("color: #66bb6a;")
+        elif jump < 1.0:
+            self._jump_lbl.setStyleSheet("color: #ffca28;")
+        else:
+            self._jump_lbl.setStyleSheet("color: #ef5350;")
         self._btn.setEnabled(len(candidate.elements) > 0)
         self._progress_bar.setVisible(False)
         self._status_lbl.setVisible(False)
@@ -171,6 +195,8 @@ class CandidateCard(QGroupBox):
         self._dev_lbl.setStyleSheet("color: #e57373;")
         self._rmse_lbl.setText("—")
         self._n_lbl.setText("—")
+        self._jump_lbl.setText("—")
+        self._jump_lbl.setStyleSheet("color: #aaa;")
         self._btn.setEnabled(False)
         self._progress_bar.setVisible(False)
         self._status_lbl.setVisible(False)

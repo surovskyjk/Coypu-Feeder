@@ -10,6 +10,31 @@ import numpy as np
 
 from PySide6.QtCore import QThread, Signal
 
+import math
+
+
+def _serialise_element_params(el: dict) -> dict:
+    """
+    Return a JSON-safe copy of an element dict for embedding in a Leaflet
+    tooltip. Floats that can be infinite (radius_start / radius_end on
+    spirals) are mapped to None (which the JS side renders as ∞). Lists
+    keep their numeric form; strings pass through.
+    """
+    out: dict = {}
+    for k, v in el.items():
+        # skip lists like [start], [end], [center] — points aren't shown in tooltips
+        if isinstance(v, list):
+            continue
+        if isinstance(v, float):
+            if math.isfinite(v):
+                out[k] = v
+            else:
+                out[k] = None
+        elif isinstance(v, (int, str)):
+            out[k] = v
+        # Skip everything else (numpy arrays, etc.)
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Search worker
@@ -129,16 +154,37 @@ class CandidateWorker(QThread):
         try:
             from geometry.candidates import CandidateGenerator, CandidateAlignment
             from geometry.projection import projected_to_wgs84
-            from geometry.alignment import reconstruct_alignment_projected
+            from geometry.alignment import (
+                reconstruct_alignment_projected,
+                reconstruct_alignment_per_element,
+            )
 
             # Use first track only for candidate generation (multi-track is Phase F)
             xy        = self._xy_list[0]
             chs       = self._chainages_list[0]
             work_epsg = self._settings.get("_work_epsg", 32633)
 
+            # Unit sanity DEBUG log (one-shot per worker run).
+            try:
+                xs, ys = xy[:, 0], xy[:, 1]
+                bbox_xy = (float(xs.min()), float(ys.min()),
+                           float(xs.max()), float(ys.max()))
+                width  = bbox_xy[2] - bbox_xy[0]
+                height = bbox_xy[3] - bbox_xy[1]
+                print(f"[CandidateWorker] working CRS EPSG:{work_epsg} | "
+                      f"bbox {bbox_xy[0]:.1f},{bbox_xy[1]:.1f} → "
+                      f"{bbox_xy[2]:.1f},{bbox_xy[3]:.1f} m "
+                      f"(extent {width:.0f}×{height:.0f} m)")
+            except Exception:
+                pass
+
             gen = CandidateGenerator(xy, chs, self._settings)
 
-            for algo_id in ["segment_fit", "segment_fit_spirals", "dp_segment", "progressive_mc", "raw"]:
+            algo_ids = ["segment_fit", "segment_fit_spirals",
+                        "dp_segment", "progressive_mc", "raw"]
+            sweep_n = int(self._settings.get("sweep_n", 3))
+
+            for algo_id in algo_ids:
                 color = self._ALGO_COLORS.get(algo_id, "#ffffff")
 
                 # --- progress text callback (called from algorithm internals) ---
@@ -166,15 +212,38 @@ class CandidateWorker(QThread):
 
                 try:
                     _pcb("Starting…")
-                    c = gen._run_one(algo_id, progress_cb=_pcb, preview_cb=_prev_cb)
+                    c = gen.run_one_with_sweep(
+                        algo_id, n=sweep_n,
+                        progress_cb=_pcb, preview_cb=_prev_cb,
+                    )
                     c.color_hex = color
-                    # Compute dense WGS84 points for map display
+                    # Compute dense WGS84 points + per-element WGS84 segments
                     if c.elements:
                         geo_xy      = reconstruct_alignment_projected(
                             c.elements, sample_interval=5.0)
                         c.geo_wgs84 = projected_to_wgs84(geo_xy, work_epsg)
+                        # Per-element segments (for tooltip-rendering)
+                        try:
+                            per_el = reconstruct_alignment_per_element(
+                                c.elements, sample_interval=2.0)
+                            seg_payload = []
+                            for el, pts in per_el:
+                                if not pts:
+                                    continue
+                                wgs = projected_to_wgs84(pts, work_epsg)
+                                # Strip non-JSON-safe values from element dict
+                                params = _serialise_element_params(el)
+                                seg_payload.append({
+                                    "type":   el.get("type", "Line"),
+                                    "params": params,
+                                    "points": [list(p) for p in wgs],
+                                })
+                            c.geo_segments_wgs84 = seg_payload
+                        except Exception:
+                            c.geo_segments_wgs84 = []
                     else:
                         c.geo_wgs84 = []
+                        c.geo_segments_wgs84 = []
                     self.candidate_ready.emit(algo_id, c)
                 except Exception as exc:
                     import traceback
@@ -213,12 +282,13 @@ class FinalExportWorker(QThread):
     force_positive  : if True, abs() applied to output coordinates
     xy_list         : list[np.ndarray] projected coords in work_epsg (for elevation)
     """
-    stage_changed    = Signal(str)
-    station_progress = Signal(float, float)
-    osm_track_ready  = Signal(list)
-    alignment_ready  = Signal(list)
-    finished         = Signal(str, int)   # filepath, output_epsg
-    failed           = Signal(str)
+    stage_changed             = Signal(str)
+    station_progress          = Signal(float, float)
+    osm_track_ready           = Signal(list)
+    alignment_ready           = Signal(list)
+    alignment_segments_ready  = Signal(list)   # per-element segments payload
+    finished                  = Signal(str, int)   # filepath, output_epsg
+    failed                    = Signal(str)
 
     def __init__(self, elements_list, tracks, settings: dict,
                  filepath: str, work_epsg: int, output_epsg: int,
@@ -242,7 +312,10 @@ class FinalExportWorker(QThread):
             self.failed.emit(f"{exc}\n{traceback.format_exc()}")
 
     def _export(self):
-        from geometry.alignment import reconstruct_alignment_projected
+        from geometry.alignment import (
+            reconstruct_alignment_projected,
+            reconstruct_alignment_per_element,
+        )
         from geometry.elevation import (
             interpolate_along_alignment, sample_elevations, fit_vertical_geometry,
         )
@@ -263,8 +336,9 @@ class FinalExportWorker(QThread):
             [[[lat, lon] for lat, lon in t.nodes] for t in self._tracks]
         )
 
-        alignments: list[dict]       = []
-        geo_wgs84_tracks: list[list] = []
+        alignments: list[dict]            = []
+        geo_wgs84_tracks: list[list]      = []
+        per_element_segments: list[dict]  = []   # accumulated across tracks
 
         for idx, track in enumerate(self._tracks):
             # Pre-fitted elements in work_epsg (auto-UTM)
@@ -286,6 +360,23 @@ class FinalExportWorker(QThread):
             # Convert to WGS84 for map display (always from UTM, no sign flip)
             geo_latlon = projected_to_wgs84(geo_xy_utm, work_epsg) if geo_xy_utm else []
             geo_wgs84_tracks.append([[lat, lon] for lat, lon in geo_latlon])
+
+            # Per-element segments (for tooltip-rich display after export)
+            if h_elements_utm:
+                try:
+                    per_el = reconstruct_alignment_per_element(
+                        h_elements_utm, sample_interval=2.0)
+                    for el, pts in per_el:
+                        if not pts:
+                            continue
+                        wgs = projected_to_wgs84(pts, work_epsg)
+                        per_element_segments.append({
+                            "type":   el.get("type", "Line"),
+                            "params": _serialise_element_params(el),
+                            "points": [list(p) for p in wgs],
+                        })
+                except Exception:
+                    pass
 
             # ── Elevation (uses work_epsg xy for chainage) ───────────────────
             self.stage_changed.emit(
@@ -324,6 +415,8 @@ class FinalExportWorker(QThread):
 
         # ── Emit reconstructed alignment for map display ─────────────────────
         self.alignment_ready.emit(geo_wgs84_tracks)
+        if per_element_segments:
+            self.alignment_segments_ready.emit(per_element_segments)
 
         self.stage_changed.emit("Building LandXML…")
         root = build_landxml(

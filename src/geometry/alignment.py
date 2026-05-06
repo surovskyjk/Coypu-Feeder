@@ -811,6 +811,42 @@ def reconstruct_alignment_projected(
     return all_pts
 
 
+def reconstruct_alignment_per_element(
+    elements: list[dict],
+    sample_interval: float = 2.0,
+) -> list[tuple[dict, list[tuple[float, float]]]]:
+    """
+    Per-element variant of `reconstruct_alignment_projected`.
+
+    Returns a list of ``(element_dict, [(x, y), ...])`` pairs, one entry per
+    input element. Adjacent segments share their junction point (no point is
+    skipped) so the per-element polylines visually connect on the map.
+
+    Used by the GUI to render per-element coloured polylines with hover
+    tooltips containing each element's parameters.
+
+    Parameters
+    ----------
+    elements        : list of element dicts
+    sample_interval : target spacing between output points in metres
+
+    Returns
+    -------
+    list[(element_dict_ref, list[(x, y)])]
+    """
+    result: list[tuple[dict, list[tuple[float, float]]]] = []
+    cur_heading: float | None = None
+
+    for el in elements:
+        pts, cur_heading = _sample_element_heading(el, sample_interval, cur_heading)
+        # Defensive: drop NaN/inf samples
+        clean = [(float(x), float(y)) for (x, y) in (pts or [])
+                 if math.isfinite(x) and math.isfinite(y)]
+        result.append((el, clean))
+
+    return result
+
+
 def _sample_element_heading(
     el: dict,
     interval: float,

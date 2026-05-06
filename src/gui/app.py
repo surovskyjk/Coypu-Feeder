@@ -147,6 +147,7 @@ class App(QMainWindow):
         # Step 7 (export) → alignment display / fit / export / restart
         self.step7_export.osm_track_ready.connect(self._on_osm_track_ready)
         self.step7_export.alignment_ready.connect(self._on_alignment_ready)
+        self.step7_export.alignment_segments_ready.connect(self._on_alignment_segments_ready)
         self.step7_export.fit_to_alignment_requested.connect(self._on_fit_to_alignment)
         self.step7_export.export_finished.connect(self._on_export_finished)
         self.step7_export.start_over_requested.connect(self._start_over)
@@ -218,11 +219,26 @@ class App(QMainWindow):
                 "nothing drawn on map."
             )
             return
+        # Default merged-red drawing; superseded by per-element rendering
+        # below when alignment_segments_ready fires.
         self.map_widget.show_alignment(alignments)
         total_pts = sum(len(a) for a in alignments)
         self.statusBar().showMessage(
             f"Both overlays ready — 🔴 red: fitted LandXML ({total_pts} pts)  "
             f"🔵 cyan dashed: OSM reference  ({len(alignments)} track(s))."
+        )
+
+    def _on_alignment_segments_ready(self, segments: list):
+        """Per-element coloured rendering after final export."""
+        if not segments:
+            return
+        self.map_widget.show_alignment_segmented(segments)
+        n_line   = sum(1 for s in segments if s.get("type") == "Line")
+        n_arc    = sum(1 for s in segments if s.get("type") == "Arc")
+        n_spiral = sum(1 for s in segments if s.get("type") == "Spiral")
+        self.statusBar().showMessage(
+            f"Per-element view drawn — 🔵 {n_line} Lines · 🔴 {n_arc} Arcs · "
+            f"🟢 {n_spiral} Spirals. Hover any segment for parameters."
         )
 
     def _on_fit_to_alignment(self):
@@ -400,14 +416,21 @@ class App(QMainWindow):
 
     def _on_candidate_selected(self, candidate):
         self._selected_candidate = candidate
-        # Clear candidate overlays; Step 5 will show the chosen one as red alignment
+        # Clear candidate overlays; Step 5 will show the chosen one as
+        # per-element coloured alignment with hover tooltips.
         self.map_widget.clear_candidates()
         xy        = self._xy_list[0]        if self._xy_list        else None
         chainages = self._chainages_list[0] if self._chainages_list else None
         self.step5_refine.prepare(candidate, xy, chainages, self._settings)
-        # Show the selected candidate on the map as the active alignment
-        if hasattr(candidate, 'geo_wgs84') and candidate.geo_wgs84:
+
+        # Prefer the per-element segmented overlay (with tooltips); fall back
+        # to the merged red polyline only if segments are unavailable.
+        segments = getattr(candidate, "geo_segments_wgs84", None)
+        if segments:
+            self.map_widget.show_alignment_segmented(segments)
+        elif getattr(candidate, "geo_wgs84", None):
             self.map_widget.show_alignment([[list(pt) for pt in candidate.geo_wgs84]])
+
         self.statusBar().showMessage(
             f"Candidate '{getattr(candidate, 'label', '')}' selected. "
             "Optionally refine spiral transitions, then Accept."
@@ -423,15 +446,39 @@ class App(QMainWindow):
 
     def _on_refine_alignment_update(self, elements: list):
         """Live map update from Step 5 when a spiral is inserted/removed."""
-        from geometry.alignment import reconstruct_alignment_projected
+        from geometry.alignment import (
+            reconstruct_alignment_projected,
+            reconstruct_alignment_per_element,
+        )
         from geometry.projection import projected_to_wgs84
 
         if not elements or not self._xy_list:
             return
         try:
-            geo_xy     = reconstruct_alignment_projected(elements, sample_interval=5.0)
-            geo_latlon = projected_to_wgs84(geo_xy, self._work_epsg)
-            self.map_widget.show_alignment([[[lat, lon] for lat, lon in geo_latlon]])
+            # Build per-element segments for tooltip-rich rendering.
+            segments_payload = []
+            try:
+                from gui.worker import _serialise_element_params
+                per_el = reconstruct_alignment_per_element(elements, sample_interval=2.0)
+                for el, pts in per_el:
+                    if not pts:
+                        continue
+                    wgs = projected_to_wgs84(pts, self._work_epsg)
+                    segments_payload.append({
+                        "type":   el.get("type", "Line"),
+                        "params": _serialise_element_params(el),
+                        "points": [list(p) for p in wgs],
+                    })
+            except Exception:
+                segments_payload = []
+
+            if segments_payload:
+                self.map_widget.show_alignment_segmented(segments_payload)
+            else:
+                geo_xy     = reconstruct_alignment_projected(elements, sample_interval=5.0)
+                geo_latlon = projected_to_wgs84(geo_xy, self._work_epsg)
+                self.map_widget.show_alignment([[[lat, lon] for lat, lon in geo_latlon]])
+
             n_spirals  = sum(1 for e in elements if e.get("type") == "Spiral")
             self.statusBar().showMessage(
                 f"Alignment updated — {len(elements)} elements "

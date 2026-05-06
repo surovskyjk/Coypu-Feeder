@@ -552,6 +552,23 @@ class MapWidget(QWidget):
         payload = [{"nodes": nodes} for nodes in alignments]
         self._run_js(f"showAlignment({json.dumps(payload)})")
 
+    def show_alignment_segmented(self, segments: list):
+        """
+        Draw the alignment as a sequence of per-element coloured polylines.
+
+        Parameters
+        ----------
+        segments : list of dicts, each shaped:
+            {"type":   "Line" | "Arc" | "Spiral",
+             "params": {length: …, sta_start: …, radius: …, ...},
+             "points": [[lat, lon], [lat, lon], ...]}
+
+        The JS side picks a colour by element type (Line=blue, Arc=red,
+        Spiral=green) and binds a sticky tooltip listing the element's
+        parameters.
+        """
+        self._run_js(f"showAlignmentSegmented({json.dumps(segments)})")
+
     def fly_to_alignment(self):
         self._run_js("flyToAlignment()")
 

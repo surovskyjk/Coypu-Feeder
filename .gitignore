@@ -13,3 +13,9 @@ output/
 dist/
 build/
 release/
+
+# Stray dev/debug scratch files (real leaflet assets live under src/gui/static/)
+debug_*.py
+/leaflet.css
+/leaflet.js
+/leaflet_bundle.txt
