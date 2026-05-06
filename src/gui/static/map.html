@@ -166,8 +166,7 @@ function showAlignment(alns) {
  * segments  : [{type:"Line"|"Arc"|"Spiral", points:[[lat,lon],...], params:{...}}, ...]
  *
  * Each element drawn as a separate coloured polyline with a sticky HTML
- * tooltip that lists its parameters. A single white glow halo is drawn
- * underneath the merged path for visibility.
+ * tooltip listing its parameters.
  */
 var ELEMENT_COLOR = {
   "Line":   "#42a5f5",
@@ -179,10 +178,11 @@ function _fmtTooltip(seg) {
   var p = seg.params || {};
   var deg = function(rad) { return (rad * 180.0 / Math.PI).toFixed(2); };
   var num = function(v, n) { if (v === undefined || v === null) return "—"; return Number(v).toFixed(n === undefined ? 2 : n); };
+  var staEnd = (p.sta_start || 0) + (p.length || 0);
   if (seg.type === "Line") {
     return "<b>Line</b><br>" +
            "Length: "      + num(p.length)         + " m<br>" +
-           "Station: "     + num(p.sta_start)      + " → " + num((p.sta_start||0) + (p.length||0)) + " m<br>" +
+           "Station: "     + num(p.sta_start)      + " → " + num(staEnd) + " m<br>" +
            "Direction: "   + (p.direction_rad !== undefined ? deg(p.direction_rad) + "°" : "—");
   } else if (seg.type === "Arc") {
     var defl = (p._deflection !== undefined) ? deg(p._deflection) : (p.deflection_deg !== undefined ? num(p.deflection_deg) : "—");
@@ -191,16 +191,16 @@ function _fmtTooltip(seg) {
            "Radius: "      + num(p.radius)         + " m<br>" +
            "Deflection: "  + defl                  + "°<br>" +
            "Rotation: "    + (p.rot || "—")        + "<br>" +
-           "Station: "     + num(p.sta_start)      + " → " + num((p.sta_start||0) + (p.length||0)) + " m";
+           "Station: "     + num(p.sta_start)      + " → " + num(staEnd) + " m";
   } else if (seg.type === "Spiral") {
-    var rs = (p.radius_start === null || p.radius_start === undefined || !isFinite(p.radius_start)) ? "∞" : num(p.radius_start) + " m";
-    var re = (p.radius_end   === null || p.radius_end   === undefined || !isFinite(p.radius_end))   ? "∞" : num(p.radius_end)   + " m";
+    var rs = (p.radius_start === null || p.radius_start === undefined) ? "∞" : num(p.radius_start) + " m";
+    var re = (p.radius_end   === null || p.radius_end   === undefined) ? "∞" : num(p.radius_end)   + " m";
     return "<b>Spiral (clothoid)</b><br>" +
            "Length: "      + num(p.length)         + " m<br>" +
            "Parameter A: " + num(p.clothoid_A)     + " m<br>" +
            "Radius: "      + rs + " → " + re        + "<br>" +
            "Rotation: "    + (p.rot || "—")        + "<br>" +
-           "Station: "     + num(p.sta_start)      + " → " + num((p.sta_start||0) + (p.length||0)) + " m";
+           "Station: "     + num(p.sta_start)      + " → " + num(staEnd) + " m";
   }
   return "<b>" + seg.type + "</b>";
 }

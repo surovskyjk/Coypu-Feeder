@@ -16,23 +16,30 @@ import math
 def _serialise_element_params(el: dict) -> dict:
     """
     Return a JSON-safe copy of an element dict for embedding in a Leaflet
-    tooltip. Floats that can be infinite (radius_start / radius_end on
-    spirals) are mapped to None (which the JS side renders as ∞). Lists
-    keep their numeric form; strings pass through.
+    tooltip. Non-finite floats (∞ / NaN) on spirals' radius_start /
+    radius_end are mapped to None (rendered as ∞ on the JS side). Lists
+    (start / end / center coordinate triples) are dropped — they aren't
+    used by the tooltip. Strings pass through. Anything number-like is
+    coerced via float().
     """
     out: dict = {}
     for k, v in el.items():
-        # skip lists like [start], [end], [center] — points aren't shown in tooltips
-        if isinstance(v, list):
+        # Skip coordinate lists / numpy arrays etc.
+        if isinstance(v, (list, tuple)):
             continue
-        if isinstance(v, float):
-            if math.isfinite(v):
-                out[k] = v
-            else:
-                out[k] = None
-        elif isinstance(v, (int, str)):
+        if isinstance(v, str):
             out[k] = v
-        # Skip everything else (numpy arrays, etc.)
+            continue
+        # Try to coerce to a number (handles Python int/float, numpy scalars,
+        # boolean, anything that float() accepts).
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(f):
+            out[k] = f
+        else:
+            out[k] = None
     return out
 
 

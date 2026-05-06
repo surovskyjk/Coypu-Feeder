@@ -423,17 +423,28 @@ class App(QMainWindow):
         chainages = self._chainages_list[0] if self._chainages_list else None
         self.step5_refine.prepare(candidate, xy, chainages, self._settings)
 
-        # Prefer the per-element segmented overlay (with tooltips); fall back
-        # to the merged red polyline only if segments are unavailable.
-        segments = getattr(candidate, "geo_segments_wgs84", None)
+        # Always draw the merged red polyline first so the user is guaranteed
+        # to see *something* even if the segmented call has any issue. Then
+        # overlay the per-element coloured polylines (which replace the merged
+        # one via clearAlignment() inside showAlignmentSegmented).
+        merged = getattr(candidate, "geo_wgs84", None)
+        if merged:
+            self.map_widget.show_alignment([[list(pt) for pt in merged]])
+
+        segments = getattr(candidate, "geo_segments_wgs84", None) or []
+        n_line   = sum(1 for s in segments if s.get("type") == "Line")
+        n_arc    = sum(1 for s in segments if s.get("type") == "Arc")
+        n_spiral = sum(1 for s in segments if s.get("type") == "Spiral")
+        print(f"[App] candidate '{getattr(candidate, 'label', '?')}' selected: "
+              f"{len(segments)} segments ({n_line} Lines, {n_arc} Arcs, {n_spiral} Spirals); "
+              f"merged_pts={len(merged) if merged else 0}")
         if segments:
             self.map_widget.show_alignment_segmented(segments)
-        elif getattr(candidate, "geo_wgs84", None):
-            self.map_widget.show_alignment([[list(pt) for pt in candidate.geo_wgs84]])
 
         self.statusBar().showMessage(
-            f"Candidate '{getattr(candidate, 'label', '')}' selected. "
-            "Optionally refine spiral transitions, then Accept."
+            f"Candidate '{getattr(candidate, 'label', '')}' selected — "
+            f"{n_line} Lines · {n_arc} Arcs · {n_spiral} Spirals shown. "
+            "Hover any segment for parameters."
         )
         self._goto_step(4)
 
